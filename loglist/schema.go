@@ -10,6 +10,7 @@
 package loglist
 
 import (
+	"strings"
 	"time"
 
 	"software.sslmate.com/src/certspotter/cttypes"
@@ -48,11 +49,36 @@ type Log struct {
 	CertspotterDownloadSize int `json:"certspotter_download_size,omitempty"`
 	CertspotterDownloadJobs int `json:"certspotter_download_jobs,omitempty"`
 
+	FileName string `json:"-"`
+
 	// TODO: add previous_operators
 }
 
 func (log *Log) IsRFC6962() bool     { return log.URL != "" }
 func (log *Log) IsStaticCTAPI() bool { return log.SubmissionURL != "" && log.MonitoringURL != "" }
+
+func (log *Log) GetCleanName() string {
+	if log.FileName != "" {
+		return log.FileName
+	}
+
+	logEntryPath := log.URL
+	logEntryPath = strings.TrimPrefix(logEntryPath, "https://")
+	logEntryPath = strings.TrimPrefix(logEntryPath, "http://")
+	logEntryPath = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '.' || r == '_' {
+			return r
+		}
+		if r == ':' || r == '/' {
+			return '_'
+		}
+		return -1 // remove this character
+	}, logEntryPath)
+	logEntryPath = strings.TrimSuffix(logEntryPath, "_")
+	log.FileName = logEntryPath
+
+	return log.FileName
+}
 
 // Return URL prefix for submission using the RFC6962 protocol
 func (log *Log) GetSubmissionURL() string {

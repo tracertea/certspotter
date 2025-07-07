@@ -11,10 +11,11 @@ package certspotter
 
 import (
 	"bytes"
-	"golang.org/x/net/idna"
 	"net"
 	"strings"
 	"unicode/utf8"
+
+	"golang.org/x/net/idna"
 )
 
 const UnparsableDNSLabelPlaceholder = "<unparsable>"

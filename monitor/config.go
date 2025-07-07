@@ -17,7 +17,6 @@ type Config struct {
 	LogListSource       string
 	State               StateProvider
 	StartAtEnd          bool
-	WatchList           WatchList
 	Verbose             bool
 	HealthCheckInterval time.Duration
 }

@@ -32,14 +32,14 @@ const keepErrorDays = 7
 const errorDateFormat = "2006-01-02"
 
 type FilesystemState struct {
-	StateDir  string
-	CacheDir  string
-	SaveCerts bool
-	Script    string
-	ScriptDir string
-	Email     []string
-	Stdout    bool
-	errorMu   sync.Mutex
+	StateDir          string
+	CacheDir          string
+	SaveCerts         bool
+	Script            string
+	ScriptDir         string
+	MaxEntriesPerFile uint64
+	Stdout            bool
+	errorMu           sync.Mutex
 }
 
 func (s *FilesystemState) logStateDir(logID LogID) string {
@@ -125,55 +125,20 @@ func (s *FilesystemState) LoadIssuer(ctx context.Context, fingerprint *[32]byte)
 }
 
 func (s *FilesystemState) NotifyCert(ctx context.Context, cert *DiscoveredCert) error {
-	var notifiedPath string
-	var paths *certPaths
-	if s.SaveCerts {
-		hexFingerprint := hex.EncodeToString(cert.SHA256[:])
-		prefixPath := filepath.Join(s.StateDir, "certs", hexFingerprint[0:2])
-		var (
-			notifiedFilename      = "." + hexFingerprint + ".notified"
-			certFilename          = hexFingerprint + ".pem"
-			jsonFilename          = hexFingerprint + ".v1.json"
-			textFilename          = hexFingerprint + ".txt"
-			legacyCertFilename    = hexFingerprint + ".cert.pem"
-			legacyPrecertFilename = hexFingerprint + ".precert.pem"
-		)
+	//  and remove https:// then replace all non-alphanumeric characters with underscores then remove trailing slashes
 
-		for _, filename := range []string{notifiedFilename, legacyCertFilename, legacyPrecertFilename} {
-			if fileExists(filepath.Join(prefixPath, filename)) {
-				return nil
-			}
-		}
+	// calculate what file we should save to based on the cert.LogEntry.Index and the s.MaxEntriesPerFile we want the quotient of the division is unint64
+	fileIndex := fmt.Sprintf("%d", (cert.LogEntry.Index/s.MaxEntriesPerFile)*s.MaxEntriesPerFile)
+	prefixPath := filepath.Join(s.StateDir, "certs", cert.LogEntry.Log.GetCleanName())
+	var (
+		jsonFilename = fileIndex + ".data"
+	)
 
-		if err := os.Mkdir(prefixPath, 0777); err != nil && !errors.Is(err, fs.ErrExist) {
-			return fmt.Errorf("error creating directory in which to save certificate %x: %w", cert.SHA256, err)
-		}
-
-		notifiedPath = filepath.Join(prefixPath, notifiedFilename)
-		paths = &certPaths{
-			certPath: filepath.Join(prefixPath, certFilename),
-			jsonPath: filepath.Join(prefixPath, jsonFilename),
-			textPath: filepath.Join(prefixPath, textFilename),
-		}
-		if err := writeCertFiles(cert, paths); err != nil {
-			return fmt.Errorf("error saving certificate %x: %w", cert.SHA256, err)
-		}
-	} else {
-		// TODO-4: save cert to temporary files, and defer their unlinking
+	if err := os.Mkdir(prefixPath, 0777); err != nil && !errors.Is(err, fs.ErrExist) {
+		return fmt.Errorf("error creating directory in which to save certificate %x: %w", cert.SHA256, err)
 	}
-
-	if err := s.notify(ctx, &notification{
-		summary: certNotificationSummary(cert),
-		environ: certNotificationEnviron(cert, paths),
-		text:    certNotificationText(cert, paths),
-	}); err != nil {
-		return fmt.Errorf("error notifying about discovered certificate for %s (%x): %w", cert.WatchItem, cert.SHA256, err)
-	}
-
-	if notifiedPath != "" {
-		if err := os.WriteFile(notifiedPath, nil, 0666); err != nil {
-			return fmt.Errorf("error saving certificate %x: %w", cert.SHA256, err)
-		}
+	if err := appendFile(filepath.Join(prefixPath, jsonFilename), cert.indexPem(), 0666); err != nil {
+		return fmt.Errorf("error saving certificate %x: %w", cert.SHA256, err)
 	}
 
 	return nil

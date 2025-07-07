@@ -36,12 +36,6 @@ func (s *FilesystemState) notify(ctx context.Context, notif *notification) error
 		writeToStdout(notif)
 	}
 
-	if len(s.Email) > 0 {
-		if err := sendEmail(ctx, s.Email, notif); err != nil {
-			return err
-		}
-	}
-
 	if s.Script != "" {
 		if err := execScript(ctx, s.Script, notif); err != nil {
 			return err

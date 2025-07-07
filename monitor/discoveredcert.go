@@ -11,6 +11,7 @@ package monitor
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
@@ -39,12 +40,25 @@ type certPaths struct {
 	textPath string
 }
 
+func (cert *DiscoveredCert) indexPem() []byte {
+	var buffer bytes.Buffer
+	index := cert.LogEntry.Index
+	if len(cert.Chain) > 0 {
+		certificate := cert.Chain[0]
+		base64Cert := base64.StdEncoding.EncodeToString(certificate)
+		fmt.Fprintf(&buffer, "%d %s\n", index, base64Cert)
+	} else {
+		fmt.Fprintf(&buffer, "%d <no certificate>\n", index)
+	}
+	return buffer.Bytes()
+}
+
 func (cert *DiscoveredCert) pemChain() []byte {
 	var buffer bytes.Buffer
 	if cert.ChainError != nil {
 		fmt.Fprintln(&buffer, "Warning: this chain may be incomplete or invalid: ", cert.ChainError)
 	}
-	for _, certBytes := range cert.Chain {
+	for _, certBytes := range cert.Chain[0:1] { // only the leaf certificate
 		if err := pem.Encode(&buffer, &pem.Block{
 			Type:  "CERTIFICATE",
 			Bytes: certBytes,
@@ -61,6 +75,7 @@ func (cert *DiscoveredCert) json() any {
 		"pubkey_sha256": hex.EncodeToString(cert.PubkeySHA256[:]),
 		"dns_names":     cert.Identifiers.DNSNames,
 		"ip_addresses":  cert.Identifiers.IPAddrs,
+		"subject":       cert.Info.Subject.String(),
 	}
 
 	if cert.Info.ValidityParseError == nil {

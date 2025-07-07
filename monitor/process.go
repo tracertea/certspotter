@@ -97,14 +97,14 @@ func processPrecertLogEntry(ctx context.Context, config *Config, issuerGetter ct
 }
 
 func processCertificate(ctx context.Context, config *Config, entry *LogEntry, certInfo *certspotter.CertInfo, getChain func(context.Context) ([]cttypes.ASN1Cert, error)) error {
-	identifiers, err := certInfo.ParseIdentifiers()
-	if err != nil {
-		return processMalformedLogEntry(ctx, config, entry, err)
-	}
-	matched, watchItem := config.WatchList.Matches(identifiers)
-	if !matched {
-		return nil
-	}
+	//identifiers, err := certInfo.ParseIdentifiers()
+	//if err != nil {
+	//	return processMalformedLogEntry(ctx, config, entry, err)
+	//}
+	//matched, watchItem := config.WatchList.Matches(identifiers)
+	//if !matched {
+	//	return nil
+	//}
 
 	chain, chainErr := getChain(ctx)
 	if chainErr != nil {
@@ -119,7 +119,6 @@ func processCertificate(ctx context.Context, config *Config, entry *LogEntry, ce
 	}
 
 	cert := &DiscoveredCert{
-		WatchItem:    watchItem,
 		LogEntry:     entry,
 		Info:         certInfo,
 		Chain:        chain,
@@ -127,7 +126,6 @@ func processCertificate(ctx context.Context, config *Config, entry *LogEntry, ce
 		TBSSHA256:    sha256.Sum256(certInfo.TBS.Raw),
 		SHA256:       sha256.Sum256(chain[0]),
 		PubkeySHA256: sha256.Sum256(certInfo.TBS.PublicKey.FullBytes),
-		Identifiers:  identifiers,
 	}
 
 	if err := config.State.NotifyCert(ctx, cert); err != nil {

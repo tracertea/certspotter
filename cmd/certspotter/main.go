@@ -144,31 +144,29 @@ func main() {
 	loglist.UserAgent = ctclient.UserAgent
 
 	var flags struct {
-		batchSize   bool
-		email       []string
-		healthcheck time.Duration
-		logs        string
-		noSave      bool
-		script      string
-		startAtEnd  bool
-		stateDir    string
-		stdout      bool
-		verbose     bool
-		version     bool
-		watchlist   string
+		batchSize         bool
+		healthcheck       time.Duration
+		logs              string
+		noSave            bool
+		script            string
+		startAtEnd        bool
+		stateDir          string
+		maxEntriesPerFile uint64
+		stdout            bool
+		verbose           bool
+		version           bool
 	}
 	flag.Func("batch_size", "Obsolete; do not use", func(string) error { flags.batchSize = true; return nil }) // TODO: remove in 0.21.0
-	flag.Func("email", "Email address to contact when matching certificate is discovered (repeatable)", appendFunc(&flags.email))
 	flag.DurationVar(&flags.healthcheck, "healthcheck", 24*time.Hour, "How frequently to perform a health check")
 	flag.StringVar(&flags.logs, "logs", defaultLogList, "File path or URL of JSON list of logs to monitor")
 	flag.BoolVar(&flags.noSave, "no_save", false, "Do not save a copy of matching certificates in state directory")
 	flag.StringVar(&flags.script, "script", "", "Program to execute when a matching certificate is discovered")
 	flag.BoolVar(&flags.startAtEnd, "start_at_end", false, "Start monitoring new logs from the end rather than the beginning (saves considerable bandwidth)")
 	flag.StringVar(&flags.stateDir, "state_dir", defaultStateDir(), "Directory for storing log position and discovered certificates")
+	flag.Uint64Var(&flags.maxEntriesPerFile, "max_entries_per_file", 100000, "Maximum number of entries to store in a single file in the state directory (default: 100000)")
 	flag.BoolVar(&flags.stdout, "stdout", false, "Write matching certificates to stdout")
 	flag.BoolVar(&flags.verbose, "verbose", false, "Print detailed information about certspotter's operation to stderr")
 	flag.BoolVar(&flags.version, "version", false, "Print version and exit")
-	flag.StringVar(&flags.watchlist, "watchlist", defaultWatchListPathIfExists(), "File containing domain names to watch")
 	flag.Parse()
 
 	if flags.batchSize {
@@ -179,19 +177,15 @@ func main() {
 		fmt.Fprintf(os.Stdout, "certspotter version %s (%s)\n", version, source)
 		os.Exit(0)
 	}
-	if flags.watchlist == "" {
-		fmt.Fprintf(os.Stderr, "%s: watch list not found: please create %s or specify alternative path using -watchlist\n", programName, defaultWatchListPath())
-		os.Exit(2)
-	}
 
 	fsstate := &monitor.FilesystemState{
-		StateDir:  flags.stateDir,
-		CacheDir:  defaultCacheDir(),
-		SaveCerts: !flags.noSave,
-		Script:    flags.script,
-		ScriptDir: defaultScriptDir(),
-		Email:     flags.email,
-		Stdout:    flags.stdout,
+		StateDir:          flags.stateDir,
+		CacheDir:          defaultCacheDir(),
+		SaveCerts:         !flags.noSave,
+		Script:            flags.script,
+		ScriptDir:         defaultScriptDir(),
+		Stdout:            flags.stdout,
+		MaxEntriesPerFile: flags.maxEntriesPerFile,
 	}
 	config := &monitor.Config{
 		LogListSource:       flags.logs,
@@ -201,16 +195,7 @@ func main() {
 		HealthCheckInterval: flags.healthcheck,
 	}
 
-	emailFileExists := false
-	if emailRecipients, err := readEmailFile(defaultEmailFile()); err == nil {
-		emailFileExists = true
-		fsstate.Email = append(fsstate.Email, emailRecipients...)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		fmt.Fprintf(os.Stderr, "%s: error reading email recipients file %q: %s\n", programName, defaultEmailFile(), err)
-		os.Exit(1)
-	}
-
-	if len(fsstate.Email) == 0 && !emailFileExists && fsstate.Script == "" && !fileExists(fsstate.ScriptDir) && fsstate.Stdout == false {
+	if fsstate.Script == "" && !fileExists(fsstate.ScriptDir) && fsstate.Stdout == false {
 		fmt.Fprintf(os.Stderr, "%s: no notification methods were specified\n", programName)
 		fmt.Fprintf(os.Stderr, "Please specify at least one of the following notification methods:\n")
 		fmt.Fprintf(os.Stderr, " - Place one or more email addresses in %s (one address per line)\n", defaultEmailFile())
@@ -221,27 +206,11 @@ func main() {
 		os.Exit(2)
 	}
 
-	if flags.watchlist == "-" {
-		watchlist, err := monitor.ReadWatchList(os.Stdin)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s: error reading watchlist from standard in: %s\n", programName, err)
-			os.Exit(1)
-		}
-		config.WatchList = watchlist
-	} else {
-		watchlist, err := readWatchListFile(flags.watchlist)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s: error reading watchlist from %q: %s\n", programName, flags.watchlist, err)
-			os.Exit(1)
-		}
-		config.WatchList = watchlist
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
-		ticker := time.NewTicker(24*time.Hour)
+		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
 		for {
 			fsstate.PruneOldErrors()

@@ -17,7 +17,29 @@ import (
 	"io"
 	"os"
 	"slices"
+	"sync"
 )
+
+// fileMutexes holds a mutex for each file being written to, to prevent race conditions.
+var fileMutexes = make(map[string]*sync.Mutex)
+
+// mapMutex protects the fileMutexes map itself.
+var mapMutex = &sync.Mutex{}
+
+// getFileMutex retrieves or creates a mutex for a specific filename.
+// This ensures that all operations on a single file are serialized.
+func getFileMutex(filename string) *sync.Mutex {
+	mapMutex.Lock()
+	defer mapMutex.Unlock()
+
+	if mu, ok := fileMutexes[filename]; ok {
+		return mu
+	}
+
+	mu := &sync.Mutex{}
+	fileMutexes[filename] = mu
+	return mu
+}
 
 func randomFileSuffix() string {
 	var randomBytes [12]byte
@@ -27,6 +49,8 @@ func randomFileSuffix() string {
 	return hex.EncodeToString(randomBytes[:])
 }
 
+// writeSyncFile opens a file with O_TRUNC, writes data, and syncs to disk.
+// This is used for atomic replacement of a file's content.
 func writeSyncFile(filename string, data []byte, perm os.FileMode) error {
 	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
@@ -42,6 +66,9 @@ func writeSyncFile(filename string, data []byte, perm os.FileMode) error {
 	return err
 }
 
+// writeFile atomically writes data to a file by first writing to a temporary file
+// and then renaming it. This is NOT concurrency-safe for the same filename
+// without external locking.
 func writeFile(filename string, data []byte, perm os.FileMode) error {
 	tempname := filename + ".tmp." + randomFileSuffix()
 	if err := writeSyncFile(tempname, data, perm); err != nil {
@@ -54,10 +81,12 @@ func writeFile(filename string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
+// writeTextFile is a helper to write a string to a file atomically.
 func writeTextFile(filename string, fileText string, perm os.FileMode) error {
 	return writeFile(filename, []byte(fileText), perm)
 }
 
+// writeJSONFile is a helper to marshal a struct to JSON and write it atomically.
 func writeJSONFile(filename string, data any, perm os.FileMode) error {
 	fileBytes, err := json.Marshal(data)
 	if err != nil {
@@ -66,6 +95,49 @@ func writeJSONFile(filename string, data any, perm os.FileMode) error {
 	fileBytes = append(fileBytes, '\n')
 	return writeFile(filename, fileBytes, perm)
 }
+
+// --- New Concurrency-Safe Append Functions ---
+
+// appendFile safely appends data to a file. It is concurrency-safe.
+// It locks a mutex associated with the filename before performing any operations.
+func appendFile(filename string, data []byte, perm os.FileMode) error {
+	mu := getFileMutex(filename)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Use O_APPEND to add to the end of the file.
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_APPEND, perm)
+	if err != nil {
+		return err
+	}
+
+	_, err = f.Write(data)
+	if err2 := f.Sync(); err2 != nil && err == nil {
+		err = err2
+	}
+	if err2 := f.Close(); err2 != nil && err == nil {
+		err = err2
+	}
+	return err
+}
+
+// appendTextFile is a helper to append a string to a file concurrently-safe.
+func appendTextFile(filename string, fileText string, perm os.FileMode) error {
+	return appendFile(filename, []byte(fileText), perm)
+}
+
+// appendJSONFile is a helper to marshal a struct to JSON and append it to a file
+// in a concurrency-safe manner.
+func appendJSONFile(filename string, data any, perm os.FileMode) error {
+	fileBytes, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	fileBytes = append(fileBytes, '\n') // Ensure each JSON object is on a new line
+	return appendFile(filename, fileBytes, perm)
+}
+
+// --- Existing Utility Functions ---
 
 func fileExists(filename string) bool {
 	_, err := os.Lstat(filename)
