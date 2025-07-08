@@ -19,4 +19,6 @@ type Config struct {
 	StartAtEnd          bool
 	Verbose             bool
 	HealthCheckInterval time.Duration
+	StartIndex          uint64
+	EndIndex            uint64
 }

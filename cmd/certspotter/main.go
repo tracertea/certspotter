@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -155,6 +156,9 @@ func main() {
 		stdout            bool
 		verbose           bool
 		version           bool
+		startIndex        uint64
+		endIndex          uint64
+		localAddr         string
 	}
 	flag.Func("batch_size", "Obsolete; do not use", func(string) error { flags.batchSize = true; return nil }) // TODO: remove in 0.21.0
 	flag.DurationVar(&flags.healthcheck, "healthcheck", 24*time.Hour, "How frequently to perform a health check")
@@ -167,6 +171,9 @@ func main() {
 	flag.BoolVar(&flags.stdout, "stdout", false, "Write matching certificates to stdout")
 	flag.BoolVar(&flags.verbose, "verbose", false, "Print detailed information about certspotter's operation to stderr")
 	flag.BoolVar(&flags.version, "version", false, "Print version and exit")
+	flag.Uint64Var(&flags.startIndex, "start-index", 0, "Log index to start processing from (requires -end-index).")
+	flag.Uint64Var(&flags.endIndex, "end-index", 0, "Log index to end processing at (requires -start-index).")
+	flag.StringVar(&flags.localAddr, "local-addr", "", "Local IP address to use for outbound connections.")
 	flag.Parse()
 
 	if flags.batchSize {
@@ -176,6 +183,28 @@ func main() {
 	if flags.version {
 		fmt.Fprintf(os.Stdout, "certspotter version %s (%s)\n", version, source)
 		os.Exit(0)
+	}
+
+	if (flags.startIndex > 0 || flags.endIndex > 0) && (flags.startIndex >= flags.endIndex) {
+		fmt.Fprintf(os.Stderr, "%s: -start-index and -end-index must be used together\n", programName)
+		os.Exit(2)
+	}
+
+	if flags.localAddr != "" {
+		customDialContext := func(ctx context.Context, network, address string) (net.Conn, error) {
+			localTCPAddr, err := net.ResolveTCPAddr(network, flags.localAddr+":0")
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve local address %s: %w", flags.localAddr, err)
+			}
+
+			d := &net.Dialer{
+				LocalAddr: localTCPAddr,
+			}
+			return d.DialContext(ctx, network, address)
+		}
+
+		customClient := ctclient.NewHTTPClient(customDialContext)
+		ctclient.SetDefaultHTTPClient(customClient)
 	}
 
 	fsstate := &monitor.FilesystemState{
@@ -193,6 +222,8 @@ func main() {
 		StartAtEnd:          flags.startAtEnd,
 		Verbose:             flags.verbose,
 		HealthCheckInterval: flags.healthcheck,
+		StartIndex:          flags.startIndex,
+		EndIndex:            flags.endIndex,
 	}
 
 	if fsstate.Script == "" && !fileExists(fsstate.ScriptDir) && fsstate.Stdout == false {

@@ -13,12 +13,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"golang.org/x/sync/errgroup"
+	"io"
+	"io/fs"
 	"log"
 	mathrand "math/rand/v2"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"software.sslmate.com/src/certspotter/ctclient"
 	"software.sslmate.com/src/certspotter/ctcrypto"
@@ -27,6 +35,189 @@ import (
 	"software.sslmate.com/src/certspotter/merkletree"
 	"software.sslmate.com/src/certspotter/sequencer"
 )
+
+func processRange(ctx context.Context, config *Config) error {
+	// Prepare the state directory structure.
+	if err := config.State.Prepare(ctx); err != nil {
+		return fmt.Errorf("error preparing state directory: %w", err)
+	}
+
+	logList, _, err := getLogList(ctx, config.LogListSource, nil)
+	if err != nil {
+		return fmt.Errorf("error loading log list for range processing: %w", err)
+	}
+
+	if len(logList) != 1 {
+		return fmt.Errorf("range processing requires a log list with exactly one log, but %d were found", len(logList))
+	}
+
+	var ctlog *loglist.Log
+	for _, l := range logList {
+		ctlog = l // Get the single log from the map
+	}
+
+	if config.EndIndex <= config.StartIndex {
+		return fmt.Errorf("end-index (%d) must be greater than start-index (%d)", config.EndIndex, config.StartIndex)
+	}
+
+	client, issuerGetter, err := newLogClient(config, ctlog)
+	if err != nil {
+		return err
+	}
+
+	// --- Resume Logic ---
+	// Create a unique state file name including the scan range to prevent collisions.
+	stateFileName := fmt.Sprintf("%s-scan-%d-%d.state", ctlog.LogID.Base64URLString(), config.StartIndex, config.EndIndex)
+	stateFilePath := filepath.Join(config.State.(*FilesystemState).StateDir, stateFileName)
+	var actualStartIndex uint64
+
+	stateBytes, err := os.ReadFile(stateFilePath)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("could not read resume state file: %w", err)
+		}
+		actualStartIndex = config.StartIndex
+		if config.Verbose {
+			log.Printf("Starting new scan for %s from index %d.", ctlog.GetMonitoringURL(), actualStartIndex)
+		}
+	} else {
+		lastProcessedIndex, err := strconv.ParseUint(strings.TrimSpace(string(stateBytes)), 10, 64)
+		if err != nil {
+			return fmt.Errorf("could not parse resume state file: %w", err)
+		}
+		actualStartIndex = lastProcessedIndex + 1
+		if config.Verbose {
+			log.Printf("Resuming scan for %s from index %d.", ctlog.GetMonitoringURL(), actualStartIndex)
+		}
+	}
+
+	if actualStartIndex >= config.EndIndex {
+		log.Println("Scan has already completed or passed the end index. Nothing to do.")
+		_ = os.Remove(stateFilePath) // Clean up any lingering state file
+		return nil
+	}
+	// --- End Resume Logic ---
+
+	group, gctx := errgroup.WithContext(ctx)
+	batches := make(chan *batch)
+	processedBatches := sequencer.New[batch](0, uint64(downloadWorkers(ctlog))*2)
+	var batchCounter uint64
+	var processWg sync.WaitGroup
+
+	// Batch Generation Worker
+	group.Go(func() error {
+		defer close(batches)
+		for i := actualStartIndex; i < config.EndIndex; i += downloadJobSize(ctlog) {
+			end := i + downloadJobSize(ctlog)
+			if end > config.EndIndex {
+				end = config.EndIndex
+			}
+			b := &batch{number: batchCounter, begin: i, end: end}
+			batchCounter++
+			select {
+			case <-gctx.Done():
+				return gctx.Err()
+			case batches <- b:
+			}
+		}
+		return nil
+	})
+
+	// Download and Process Workers
+	numWorkers := downloadWorkers(ctlog)
+	processWg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		group.Go(func() error {
+			defer processWg.Done()
+			for b := range batches {
+				select {
+				case <-gctx.Done():
+					return gctx.Err()
+				default:
+				}
+
+				entries, err := getEntriesFull(gctx, client, b.begin, b.end)
+				if err != nil {
+					return err
+				}
+				b.entries = entries
+
+				for offset, entry := range b.entries {
+					index := b.begin + uint64(offset)
+					if err := processLogEntry(gctx, config, issuerGetter, &LogEntry{
+						Entry: entry,
+						Index: index,
+						Log:   ctlog,
+					}); err != nil {
+						return fmt.Errorf("error processing entry %d: %w", index, err)
+					}
+				}
+
+				if err := processedBatches.Add(gctx, b.number, b); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+
+	// Coordinator to close the sequencer once all processors are done
+	group.Go(func() error {
+		processWg.Wait()
+		processedBatches.Close()
+		return nil
+	})
+
+	// State Saving Worker
+	group.Go(func() error {
+		for {
+			b, err := processedBatches.Next(gctx)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return nil // All items processed
+				}
+				return err
+			}
+
+			lastProcessed := b.end - 1
+			stateContent := strconv.FormatUint(lastProcessed, 10)
+			if err := writeTextFile(stateFilePath, stateContent, 0666); err != nil {
+				log.Printf("CRITICAL: Failed to save resume state: %v", err)
+				return err
+			}
+			if config.Verbose {
+				log.Printf("Progress saved. Last processed index: %d", lastProcessed)
+			}
+		}
+	})
+
+	err = group.Wait()
+	if err == nil {
+		// Success! Clean up the state file...
+		_ = os.Remove(stateFilePath)
+
+		// ...and create the completion receipt.
+		completionFileName := fmt.Sprintf("%s-scan-%d-%d.completed", ctlog.LogID.Base64URLString(), config.StartIndex, config.EndIndex)
+		completionFilePath := filepath.Join(config.State.(*FilesystemState).StateDir, completionFileName)
+		completionContent := fmt.Sprintf(
+			"Scan completed successfully.\nTimestamp: %s\nLog: %s\nRange: %d - %d\n",
+			time.Now().UTC().Format(time.RFC3339),
+			ctlog.GetMonitoringURL(),
+			config.StartIndex,
+			config.EndIndex,
+		)
+
+		if err := writeTextFile(completionFilePath, completionContent, 0666); err != nil {
+			// This is not a critical error, but we should log it.
+			log.Printf("WARNING: Could not write completion receipt file: %v", err)
+		}
+
+		if config.Verbose {
+			log.Printf("Scan completed successfully. Removed resume state file and created completion receipt.")
+		}
+	}
+	return err
+}
 
 const (
 	getSTHInterval    = 5 * time.Minute
@@ -126,9 +317,9 @@ func (client *logClient) GetRoots(ctx context.Context) (roots [][]byte, err erro
 	})
 	return
 }
-func (client *logClient) GetEntries(ctx context.Context, startInclusive, endInclusive uint64) (entries []ctclient.Entry, err error) {
+func (client *logClient) GetEntries(ctx context.Context, startInclusive, endExclusive uint64) (entries []ctclient.Entry, err error) {
 	err = withRetry(ctx, client.config, client.log, -1, func() error {
-		entries, err = client.client.GetEntries(ctx, startInclusive, endInclusive)
+		entries, err = client.client.GetEntries(ctx, startInclusive, endExclusive)
 		return err
 	})
 	return

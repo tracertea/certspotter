@@ -13,11 +13,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"golang.org/x/sync/errgroup"
 	"log"
 	insecurerand "math/rand"
-	"software.sslmate.com/src/certspotter/loglist"
 	"time"
+
+	"golang.org/x/sync/errgroup"
+	"software.sslmate.com/src/certspotter/loglist"
 )
 
 const (
@@ -39,11 +40,11 @@ type task struct {
 }
 
 type daemon struct {
-	config         *Config
-	taskgroup      *errgroup.Group
-	tasks          map[LogID]task
-	logsLoadedAt   time.Time
-	logListToken   *loglist.ModificationToken
+	config       *Config
+	taskgroup    *errgroup.Group
+	tasks        map[LogID]task
+	logsLoadedAt time.Time
+	logListToken *loglist.ModificationToken
 }
 
 func (daemon *daemon) healthCheck(ctx context.Context) error {
@@ -57,10 +58,10 @@ func (daemon *daemon) healthCheck(ctx context.Context) error {
 			errorsDir = fsstate.errorDir(nil)
 		}
 		info := &StaleLogListInfo{
-			Source:        daemon.config.LogListSource,
-			LastSuccess:   daemon.logsLoadedAt,
-			RecentErrors:  errors,
-			ErrorsDir:     errorsDir,
+			Source:       daemon.config.LogListSource,
+			LastSuccess:  daemon.logsLoadedAt,
+			RecentErrors: errors,
+			ErrorsDir:    errorsDir,
 		}
 		if err := daemon.config.State.NotifyHealthCheckFailure(ctx, nil, info); err != nil {
 			return fmt.Errorf("error notifying about stale log list: %w", err)
@@ -161,6 +162,11 @@ func (daemon *daemon) run(ctx context.Context) error {
 }
 
 func Run(ctx context.Context, config *Config) error {
+	// If start and end indexes are specified, run in one-shot mode.
+	if config.StartIndex > 0 || config.EndIndex > 0 {
+		return processRange(ctx, config)
+	}
+
 	group, ctx := errgroup.WithContext(ctx)
 	daemon := &daemon{
 		config:    config,

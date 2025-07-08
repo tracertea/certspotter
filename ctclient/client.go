@@ -58,6 +58,10 @@ func NewHTTPClient(dialContext func(context.Context, string, string) (net.Conn, 
 
 var defaultHTTPClient = NewHTTPClient(nil)
 
+func SetDefaultHTTPClient(client *http.Client) {
+	defaultHTTPClient = client
+}
+
 func get(ctx context.Context, httpClient *http.Client, fullURL string) ([]byte, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 	if err != nil {

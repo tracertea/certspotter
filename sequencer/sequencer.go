@@ -11,6 +11,7 @@ package sequencer
 
 import (
 	"context"
+	"io"
 	"slices"
 	"sync"
 )
@@ -31,6 +32,7 @@ type Channel[T any] struct {
 	writers     []seqWriter
 	readWaiting bool
 	readReady   chan struct{}
+	closed      bool
 }
 
 func New[T any](initialSequenceNumber uint64, capacity uint64) *Channel[T] {
@@ -124,7 +126,11 @@ func (seq *Channel[T]) Add(ctx context.Context, sequenceNumber uint64, item *T) 
 // Not safe to call concurrently with other Next calls.
 func (seq *Channel[T]) Next(ctx context.Context) (*T, error) {
 	seq.mu.Lock()
-	if seq.buf[seq.index(seq.next)] == nil {
+	for seq.buf[seq.index(seq.next)] == nil {
+		if seq.closed {
+			seq.mu.Unlock()
+			return nil, io.EOF
+		}
 		seq.readWaiting = true
 		seq.mu.Unlock()
 		select {
@@ -148,4 +154,21 @@ func (seq *Channel[T]) Next(ctx context.Context) (*T, error) {
 	seq.next++
 	seq.mu.Unlock()
 	return item, nil
+}
+
+// Close signals that no more items will be sent to the channel.
+// Subsequent calls to Next will return io.EOF after all buffered items are consumed.
+func (seq *Channel[T]) Close() {
+	seq.mu.Lock()
+	defer seq.mu.Unlock()
+
+	if seq.closed {
+		return
+	}
+	seq.closed = true
+
+	if seq.readWaiting {
+		// Wake up a waiting reader, if any.
+		seq.readReady <- struct{}{}
+	}
 }
