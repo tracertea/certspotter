@@ -11,8 +11,8 @@ package cttypes
 
 import (
 	"fmt"
+	"github.com/tracertea/src/certspotter/tlstypes"
 	"golang.org/x/crypto/cryptobyte"
-	"software.sslmate.com/src/certspotter/tlstypes"
 )
 
 type SignedCertificateTimestamp struct {

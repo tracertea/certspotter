@@ -17,7 +17,7 @@ import (
 	"crypto/x509"
 	"fmt"
 
-	"software.sslmate.com/src/certspotter/tlstypes"
+	"github.com/tracertea/src/certspotter/tlstypes"
 )
 
 type PublicKey []byte

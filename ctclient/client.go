@@ -26,8 +26,52 @@ import (
 
 var UserAgent = ""
 
+// NewHTTPClient creates an HTTP client suitable for communicating with CT logs using the default environment proxy settings.
+func NewHTTPClient() *http.Client {
+	return NewHTTPClientWithProxy(nil)
+}
+
+// NewHTTPClientWithProxy creates an HTTP client suitable for communicating with CT logs via a specific proxy.
+// If proxyURL is nil, http.ProxyFromEnvironment is used.
+func NewHTTPClientWithProxy(proxyURL *url.URL) *http.Client {
+	proxyFunc := http.ProxyFromEnvironment
+	if proxyURL != nil {
+		proxyFunc = http.ProxyURL(proxyURL)
+	}
+
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy: proxyFunc,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			TLSClientConfig: &tls.Config{
+				// We have to disable TLS certificate validation because because several logs
+				// (WoSign, StartCom, GDCA) use certificates that are not widely trusted.
+				// Since we verify that every response we receive from the log is signed
+				// by the log's CT public key (either directly, or indirectly via the Merkle Tree),
+				// TLS certificate validation is not actually necessary.  (We don't want to manage
+				// our own trust store because that adds undesired complexity and would require
+				// updating should a log ever change to a different CA.)
+				InsecureSkipVerify: true,
+			},
+			ForceAttemptHTTP2: true,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("redirects not followed")
+		},
+		Timeout: 60 * time.Second,
+	}
+}
+
 // Create an HTTP client suitable for communicating with CT logs.  dialContext, if non-nil, is used for dialing.
-func NewHTTPClient(dialContext func(context.Context, string, string) (net.Conn, error)) *http.Client {
+func NewDialHTTPClient(dialContext func(context.Context, string, string) (net.Conn, error)) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
@@ -37,7 +81,7 @@ func NewHTTPClient(dialContext func(context.Context, string, string) (net.Conn, 
 			IdleConnTimeout:       90 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 			TLSClientConfig: &tls.Config{
-				// We have to disable TLS certificate validation because because several logs
+				// We have to disable TLS certificate validation because several logs
 				// (WoSign, StartCom, GDCA) use certificates that are not widely trusted.
 				// Since we verify that every response we receive from the log is signed
 				// by the log's CT public key (either directly, or indirectly via the Merkle Tree),
@@ -56,7 +100,7 @@ func NewHTTPClient(dialContext func(context.Context, string, string) (net.Conn, 
 	}
 }
 
-var defaultHTTPClient = NewHTTPClient(nil)
+var defaultHTTPClient = NewHTTPClient()
 
 func SetDefaultHTTPClient(client *http.Client) {
 	defaultHTTPClient = client

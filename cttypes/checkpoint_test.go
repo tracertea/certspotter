@@ -11,7 +11,7 @@ package cttypes
 
 import (
 	"bytes"
-	"software.sslmate.com/src/certspotter/tlstypes"
+	"github.com/tracertea/src/certspotter/tlstypes"
 	"testing"
 )
 

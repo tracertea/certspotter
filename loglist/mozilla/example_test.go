@@ -19,7 +19,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"software.sslmate.com/src/certspotter/loglist/mozilla"
+	"github.com/tracertea/src/certspotter/loglist/mozilla"
 )
 
 func ExampleParse() {

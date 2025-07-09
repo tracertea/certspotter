@@ -23,9 +23,9 @@ import (
 	"sync"
 	"time"
 
-	"software.sslmate.com/src/certspotter/cttypes"
-	"software.sslmate.com/src/certspotter/loglist"
-	"software.sslmate.com/src/certspotter/merkletree"
+	"github.com/tracertea/src/certspotter/cttypes"
+	"github.com/tracertea/src/certspotter/loglist"
+	"github.com/tracertea/src/certspotter/merkletree"
 )
 
 const keepErrorDays = 7

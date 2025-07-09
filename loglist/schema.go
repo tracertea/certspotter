@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"software.sslmate.com/src/certspotter/cttypes"
+	"github.com/tracertea/src/certspotter/cttypes"
 )
 
 type List struct {

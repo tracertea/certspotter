@@ -11,8 +11,8 @@ package cttypes
 
 import (
 	"fmt"
+	"github.com/tracertea/src/certspotter/merkletree"
 	"golang.org/x/crypto/cryptobyte"
-	"software.sslmate.com/src/certspotter/merkletree"
 )
 
 type MerkleLeafType uint8

@@ -13,7 +13,7 @@ import (
 	"context"
 	"log"
 
-	"software.sslmate.com/src/certspotter/loglist"
+	"github.com/tracertea/src/certspotter/loglist"
 )
 
 func recordError(ctx context.Context, config *Config, ctlog *loglist.Log, errToRecord error) {

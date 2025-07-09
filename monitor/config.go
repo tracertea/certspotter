@@ -21,4 +21,5 @@ type Config struct {
 	HealthCheckInterval time.Duration
 	StartIndex          uint64
 	EndIndex            uint64
+	Proxies             []string
 }

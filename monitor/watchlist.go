@@ -12,9 +12,9 @@ package monitor
 import (
 	"bufio"
 	"fmt"
+	"github.com/tracertea/src/certspotter"
 	"golang.org/x/net/idna"
 	"io"
-	"software.sslmate.com/src/certspotter"
 	"strings"
 )
 

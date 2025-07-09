@@ -17,8 +17,8 @@ import (
 	insecurerand "math/rand"
 	"time"
 
+	"github.com/tracertea/src/certspotter/loglist"
 	"golang.org/x/sync/errgroup"
-	"software.sslmate.com/src/certspotter/loglist"
 )
 
 const (

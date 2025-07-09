@@ -13,7 +13,7 @@ import (
 	"crypto/sha256"
 	"golang.org/x/crypto/cryptobyte"
 
-	"software.sslmate.com/src/certspotter/cttypes"
+	"github.com/tracertea/src/certspotter/cttypes"
 )
 
 type SignatureInput [32]byte

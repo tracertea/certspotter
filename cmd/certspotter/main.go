@@ -26,9 +26,9 @@ import (
 	"syscall"
 	"time"
 
-	"software.sslmate.com/src/certspotter/ctclient"
-	"software.sslmate.com/src/certspotter/loglist"
-	"software.sslmate.com/src/certspotter/monitor"
+	"github.com/tracertea/src/certspotter/ctclient"
+	"github.com/tracertea/src/certspotter/loglist"
+	"github.com/tracertea/src/certspotter/monitor"
 )
 
 var programName = os.Args[0]
@@ -159,11 +159,13 @@ func main() {
 		startIndex        uint64
 		endIndex          uint64
 		localAddr         string
+		proxies           []string
 	}
 	flag.Func("batch_size", "Obsolete; do not use", func(string) error { flags.batchSize = true; return nil }) // TODO: remove in 0.21.0
 	flag.DurationVar(&flags.healthcheck, "healthcheck", 24*time.Hour, "How frequently to perform a health check")
 	flag.StringVar(&flags.logs, "logs", defaultLogList, "File path or URL of JSON list of logs to monitor")
 	flag.BoolVar(&flags.noSave, "no_save", false, "Do not save a copy of matching certificates in state directory")
+	flag.Func("proxy", "Proxy to use for HTTP requests (repeatable). E.g. http://user:pass@host:port", appendFunc(&flags.proxies))
 	flag.StringVar(&flags.script, "script", "", "Program to execute when a matching certificate is discovered")
 	flag.BoolVar(&flags.startAtEnd, "start_at_end", false, "Start monitoring new logs from the end rather than the beginning (saves considerable bandwidth)")
 	flag.StringVar(&flags.stateDir, "state_dir", defaultStateDir(), "Directory for storing log position and discovered certificates")
@@ -203,7 +205,7 @@ func main() {
 			return d.DialContext(ctx, network, address)
 		}
 
-		customClient := ctclient.NewHTTPClient(customDialContext)
+		customClient := ctclient.NewDialHTTPClient(customDialContext)
 		ctclient.SetDefaultHTTPClient(customClient)
 	}
 
@@ -222,6 +224,7 @@ func main() {
 		StartAtEnd:          flags.startAtEnd,
 		Verbose:             flags.verbose,
 		HealthCheckInterval: flags.healthcheck,
+		Proxies:             flags.proxies,
 		StartIndex:          flags.startIndex,
 		EndIndex:            flags.endIndex,
 	}

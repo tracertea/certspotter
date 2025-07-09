@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"software.sslmate.com/src/certspotter/cttypes"
-	"software.sslmate.com/src/certspotter/loglist"
+	"github.com/tracertea/src/certspotter/cttypes"
+	"github.com/tracertea/src/certspotter/loglist"
 )
 
 const recentErrorCount = 10
@@ -112,10 +112,10 @@ type BacklogInfo struct {
 }
 
 type StaleLogListInfo struct {
-	Source        string
-	LastSuccess   time.Time
-	RecentErrors  string
-	ErrorsDir     string
+	Source       string
+	LastSuccess  time.Time
+	RecentErrors string
+	ErrorsDir    string
 }
 
 func (e *StaleSTHInfo) LastSuccessString() string {

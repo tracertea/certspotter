@@ -1,4 +1,4 @@
-module software.sslmate.com/src/certspotter
+module github.com/tracertea/src/certspotter
 
 go 1.24.4
 

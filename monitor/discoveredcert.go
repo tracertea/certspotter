@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"software.sslmate.com/src/certspotter"
-	"software.sslmate.com/src/certspotter/cttypes"
+	"github.com/tracertea/src/certspotter"
+	"github.com/tracertea/src/certspotter/cttypes"
 )
 
 type DiscoveredCert struct {

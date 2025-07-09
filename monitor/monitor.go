@@ -28,12 +28,12 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"software.sslmate.com/src/certspotter/ctclient"
-	"software.sslmate.com/src/certspotter/ctcrypto"
-	"software.sslmate.com/src/certspotter/cttypes"
-	"software.sslmate.com/src/certspotter/loglist"
-	"software.sslmate.com/src/certspotter/merkletree"
-	"software.sslmate.com/src/certspotter/sequencer"
+	"github.com/tracertea/src/certspotter/ctclient"
+	"github.com/tracertea/src/certspotter/ctcrypto"
+	"github.com/tracertea/src/certspotter/cttypes"
+	"github.com/tracertea/src/certspotter/loglist"
+	"github.com/tracertea/src/certspotter/merkletree"
+	"github.com/tracertea/src/certspotter/sequencer"
 )
 
 func processRange(ctx context.Context, config *Config) error {
@@ -402,7 +402,7 @@ func newLogClient(config *Config, ctlog *loglist.Log) (ctclient.Log, ctclient.Is
 }
 
 func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.Log) (returnedErr error) {
-	client, issuerGetter, err := newLogClient(config, ctlog)
+	clients, issuerGetter, err := newLogClients(config, ctlog)
 	if err != nil {
 		return err
 	}
@@ -415,11 +415,11 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 	}
 	if state == nil {
 		if config.StartAtEnd {
-			sth, _, err := client.GetSTH(ctx)
+			sth, _, err := clients[0].GetSTH(ctx)
 			if err != nil {
 				return err
 			}
-			tree, err := client.ReconstructTree(ctx, sth)
+			tree, err := clients[0].ReconstructTree(ctx, sth)
 			if err != nil {
 				return err
 			}
@@ -469,19 +469,29 @@ retry:
 	// saveStateWorker       - builds the Merkle Tree and compares against STHs
 
 	sths := make(chan *cttypes.SignedTreeHead, 1)
-	batches := make(chan *batch, downloadWorkers(ctlog))
-	processedBatches := sequencer.New[batch](0, uint64(downloadWorkers(ctlog))*10)
+	totalWorkers := downloadWorkers(ctlog) * len(clients)
+	batches := make(chan *batch, totalWorkers)
+	processedBatches := sequencer.New[batch](0, uint64(totalWorkers)*10)
 
 	group, gctx := errgroup.WithContext(ctx)
-	group.Go(func() error { return getSTHWorker(gctx, config, ctlog, client, sths) })
+	group.Go(func() error { return getSTHWorker(gctx, config, ctlog, clients[0], sths) })
 	group.Go(func() error { return generateBatchesWorker(gctx, config, ctlog, position, sths, batches) })
-	for range downloadWorkers(ctlog) {
-		downloadedBatches := make(chan *batch, 1)
-		group.Go(func() error { return downloadWorker(gctx, config, ctlog, client, batches, downloadedBatches) })
-		group.Go(func() error {
-			return processWorker(gctx, config, ctlog, issuerGetter, downloadedBatches, processedBatches)
-		})
+
+	for i, client := range clients {
+		for j := 0; j < downloadWorkers(ctlog); j++ {
+			c := client
+			if config.Verbose {
+				log.Printf("%s: starting download worker %d for proxy %d", ctlog.GetMonitoringURL(), j, i)
+			}
+
+			downloadedBatches := make(chan *batch, 1)
+			group.Go(func() error { return downloadWorker(gctx, config, ctlog, c, batches, downloadedBatches) })
+			group.Go(func() error {
+				return processWorker(gctx, config, ctlog, issuerGetter, downloadedBatches, processedBatches)
+			})
+		}
 	}
+
 	group.Go(func() error { return saveStateWorker(gctx, config, ctlog, state, processedBatches) })
 
 	err = group.Wait()
@@ -497,6 +507,80 @@ retry:
 		goto retry
 	}
 	return err
+}
+
+func newLogClientForProxy(config *Config, ctlog *loglist.Log, proxy string) (ctclient.Log, ctclient.IssuerGetter, error) {
+	var httpClient *http.Client
+	if proxy != "" {
+		proxyURL, err := url.Parse(proxy)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid proxy URL %q: %w", proxy, err)
+		}
+		httpClient = ctclient.NewHTTPClientWithProxy(proxyURL)
+	}
+
+	switch {
+	case ctlog.IsRFC6962():
+		logURL, err := url.Parse(ctlog.URL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("log has invalid URL: %w", err)
+		}
+		return &logClient{
+			config: config,
+			log:    ctlog,
+			client: &ctclient.RFC6962Log{URL: logURL, HTTPClient: httpClient},
+		}, nil, nil
+	case ctlog.IsStaticCTAPI():
+		submissionURL, err := url.Parse(ctlog.SubmissionURL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("log has invalid submission URL: %w", err)
+		}
+		monitoringURL, err := url.Parse(ctlog.MonitoringURL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("log has invalid monitoring URL: %w", err)
+		}
+		client := &ctclient.StaticLog{
+			SubmissionURL: submissionURL,
+			MonitoringURL: monitoringURL,
+			ID:            ctlog.LogID,
+			HTTPClient:    httpClient,
+		}
+		return &logClient{
+				config: config,
+				log:    ctlog,
+				client: client,
+			}, &issuerGetter{
+				config:    config,
+				log:       ctlog,
+				logGetter: client,
+			}, nil
+	default:
+		return nil, nil, errors.New("log uses unknown protocol")
+	}
+}
+
+func newLogClients(config *Config, ctlog *loglist.Log) ([]ctclient.Log, ctclient.IssuerGetter, error) {
+	if len(config.Proxies) == 0 {
+		client, issuerGetter, err := newLogClientForProxy(config, ctlog, "")
+		if err != nil {
+			return nil, nil, err
+		}
+		return []ctclient.Log{client}, issuerGetter, nil
+	}
+
+	var clients []ctclient.Log
+	var firstIssuerGetter ctclient.IssuerGetter
+	for _, proxy := range config.Proxies {
+		client, issuerGetter, err := newLogClientForProxy(config, ctlog, proxy)
+		if err != nil {
+			return nil, nil, err
+		}
+		clients = append(clients, client)
+		if firstIssuerGetter == nil {
+			firstIssuerGetter = issuerGetter
+		}
+	}
+	return clients, firstIssuerGetter, nil
 }
 
 func getSTHWorker(ctx context.Context, config *Config, ctlog *loglist.Log, client ctclient.Log, sthsOut chan<- *cttypes.SignedTreeHead) error {

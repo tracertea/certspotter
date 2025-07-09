@@ -10,8 +10,8 @@
 package cttypes
 
 import (
-	"software.sslmate.com/src/certspotter/merkletree"
-	"software.sslmate.com/src/certspotter/tlstypes"
+	"github.com/tracertea/src/certspotter/merkletree"
+	"github.com/tracertea/src/certspotter/tlstypes"
 	"time"
 )
 

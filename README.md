@@ -29,7 +29,7 @@ The following instructions require you to have [Go version 1.21 or higher](https
 1. Install the certspotter command using the `go` command:
 
    ```
-   go install software.sslmate.com/src/certspotter/cmd/certspotter@latest
+   go install github.com/tracertea/src/certspotter/cmd/certspotter@latest
    ```
 
 2. Create a watch list file `$HOME/.certspotter/watchlist` containing the DNS names you want to monitor,
