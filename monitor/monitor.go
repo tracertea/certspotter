@@ -10,6 +10,7 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -21,10 +22,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -105,6 +108,15 @@ func processRange(ctx context.Context, config *Config) error {
 	var batchCounter uint64
 	var processWg sync.WaitGroup
 
+	// Channel for certificates ready to be saved
+	certsToSave := make(chan *DiscoveredCert, 1024)
+
+	// Start the new batch-saving worker
+	group.Go(func() error {
+		fsState := config.State.(*FilesystemState)
+		return saveCertBatchWorker(gctx, certsToSave, fsState.StateDir, fsState.MaxEntriesPerFile)
+	})
+
 	// Batch Generation Worker
 	group.Go(func() error {
 		defer close(batches)
@@ -149,7 +161,7 @@ func processRange(ctx context.Context, config *Config) error {
 						Entry: entry,
 						Index: index,
 						Log:   ctlog,
-					}); err != nil {
+					}, certsToSave); err != nil {
 						return fmt.Errorf("error processing entry %d: %w", index, err)
 					}
 				}
@@ -193,6 +205,8 @@ func processRange(ctx context.Context, config *Config) error {
 	})
 
 	err = group.Wait()
+	close(certsToSave) // Signal the save worker to finish up and exit
+
 	if err == nil {
 		// Success! Clean up the state file...
 		_ = os.Remove(stateFilePath)
@@ -340,21 +354,6 @@ func (client *logClient) GetRoots(ctx context.Context) (roots [][]byte, err erro
 	return
 }
 
-//func (client *logClient) GetEntries(ctx context.Context, startInclusive, endExclusive uint64) (entries []ctclient.Entry, err error) {
-//	err = withRetry(ctx, client.config, client.log, -1, func() error {
-//		entries, err = client.client.GetEntries(ctx, startInclusive, endExclusive)
-//		return err
-//	})
-//	return
-//}
-//func (client *logClient) ReconstructTree(ctx context.Context, sth *cttypes.SignedTreeHead) (tree *merkletree.CollapsedTree, err error) {
-//	err = withRetry(ctx, client.config, client.log, -1, func() error {
-//		tree, err = client.client.ReconstructTree(ctx, sth)
-//		return err
-//	})
-//	return
-//}
-
 type issuerGetter struct {
 	config    *Config
 	log       *loglist.Log
@@ -446,7 +445,7 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 		return fmt.Errorf("error loading log state: %w", err)
 	}
 	if state == nil {
-		client, err := proxyManager.GetClient()
+		client, _, err := proxyManager.GetClient()
 		if err != nil {
 			return fmt.Errorf("failed to get initial client: %w", err)
 		}
@@ -484,7 +483,6 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 			log.Printf("%s: resuming monitoring from position %d", ctlog.GetMonitoringURL(), state.DownloadPosition.Size())
 		}
 	}
-
 	defer func() {
 		storeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -493,36 +491,94 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 		}
 	}()
 
-retry:
-	position := state.DownloadPosition.Size()
-
-	sths := make(chan *cttypes.SignedTreeHead, 1)
-	totalWorkers := downloadWorkers(ctlog) * len(config.Proxies)
-	if totalWorkers == 0 {
-		totalWorkers = 1
-	}
-	batches := make(chan *batch, totalWorkers)
-	processedBatches := sequencer.New[batch](0, uint64(totalWorkers)*10)
+	// Channel for certificates ready to be saved. Buffered to absorb bursts.
+	certsToSave := make(chan *DiscoveredCert, 2048)
 
 	group, gctx := errgroup.WithContext(ctx)
 
-	client, err := proxyManager.GetClient()
+	// Start the new batch-saving worker.
+	fsState := config.State.(*FilesystemState)
+	group.Go(func() error {
+		return saveCertBatchWorker(gctx, certsToSave, fsState.StateDir, fsState.MaxEntriesPerFile)
+	})
+
+retry:
+	position := state.DownloadPosition.Size()
+
+	var latestTreeSize atomic.Uint64
+	if state.VerifiedSTH != nil {
+		latestTreeSize.Store(state.VerifiedSTH.TreeSize)
+	}
+
+	numDownloaders := downloadWorkers(ctlog) * len(proxyManager.proxies)
+	if numDownloaders == 0 {
+		numDownloaders = 1
+	}
+	numProcessors := runtime.NumCPU() * 2
+	if numProcessors < 4 {
+		numProcessors = 4
+	}
+
+	if config.Verbose {
+		log.Printf(
+			"Initializing workers for %s: %d Downloaders, %d Processors",
+			ctlog.GetCleanName(), numDownloaders, numProcessors,
+		)
+	}
+
+	batchesToDownload := make(chan *batch, numDownloaders)
+	batchesToProcess := make(chan *batch, numDownloaders)
+	processedBatches := sequencer.New[batch](0, uint64(numDownloaders+numProcessors)*10)
+
+	// A new errgroup is needed for each retry attempt.
+	group, gctx = errgroup.WithContext(ctx)
+
+	client, _, err := proxyManager.GetClient()
 	if err != nil {
 		return fmt.Errorf("no proxies available to start STH worker: %w", err)
 	}
-	group.Go(func() error { return getSTHWorker(gctx, config, ctlog, client, sths) })
 
-	group.Go(func() error { return generateBatchesWorker(gctx, config, ctlog, position, sths, batches) })
+	group.Go(func() error { return getSTHAndUpdateWorker(gctx, client, &latestTreeSize) })
 
-	for i := 0; i < totalWorkers; i++ {
-		downloadedBatches := make(chan *batch, 1)
-		group.Go(func() error { return downloadWorker(gctx, proxyManager, batches, downloadedBatches) })
+	group.Go(func() error {
+		defer close(batchesToDownload)
+		return generateBatchesWorker(gctx, ctlog, &position, &latestTreeSize, batchesToDownload)
+	})
+
+	var downloadWg sync.WaitGroup
+	downloadWg.Add(numDownloaders)
+	for i := 0; i < numDownloaders; i++ {
 		group.Go(func() error {
-			return processWorker(gctx, config, ctlog, issuerGetter, downloadedBatches, processedBatches)
+			defer downloadWg.Done()
+			return downloadWorker(gctx, proxyManager, batchesToDownload, batchesToProcess)
 		})
 	}
 
-	group.Go(func() error { return saveStateWorker(gctx, config, ctlog, state, processedBatches) })
+	group.Go(func() error {
+		downloadWg.Wait()
+		close(batchesToProcess)
+		return nil
+	})
+
+	var processWg sync.WaitGroup
+	processWg.Add(numProcessors)
+	for i := 0; i < numProcessors; i++ {
+		group.Go(func() error {
+			defer processWg.Done()
+			return processWorker(gctx, config, ctlog, issuerGetter, batchesToProcess, certsToSave)
+		})
+	}
+
+	group.Go(func() error {
+		processWg.Wait()
+		// No longer closing batchesToProcess here, it's handled by the download coordinator.
+		// We also don't close processedBatches here. It's closed by the saveStateWorker.
+		return nil
+	})
+
+	group.Go(func() error {
+		return saveStateWorker(gctx, config, ctlog, state, processedBatches, proxyManager)
+	})
 
 	err = group.Wait()
 	if verifyErr := (*verifyEntriesError)(nil); errors.As(err, &verifyErr) {
@@ -536,7 +592,91 @@ retry:
 		}
 		goto retry
 	}
+	close(certsToSave) // Signal the save worker to finish when the main group is done.
 	return err
+}
+
+// saveCertBatchWorker is a new worker that buffers certificates and writes them to disk in batches.
+func saveCertBatchWorker(ctx context.Context, certsIn <-chan *DiscoveredCert, stateDir string, maxEntriesPerFile uint64) error {
+	const (
+		// Write to disk when a buffer reaches this size.
+		flushThreshold = 1000
+		// Also write to disk at this interval, to flush any remaining items.
+		flushInterval = 5 * time.Second
+	)
+
+	// buffers maps a target filename to a list of certificates to be written.
+	buffers := make(map[string][]*DiscoveredCert)
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	// flush writes the content of a buffer to its file and then clears the buffer.
+	flush := func(filename string) error {
+		if len(buffers[filename]) == 0 {
+			return nil
+		}
+
+		// Prepare the directory.
+		if err := os.MkdirAll(filepath.Dir(filename), 0777); err != nil {
+			return fmt.Errorf("error creating certs directory: %w", err)
+		}
+
+		var b bytes.Buffer
+		for _, cert := range buffers[filename] {
+			b.Write(cert.indexPem())
+		}
+
+		// appendFile is concurrency-safe, so we can call it without an external lock.
+		if err := appendFile(filename, b.Bytes(), 0666); err != nil {
+			log.Printf("ERROR: Failed to write certificate batch to %s: %v", filename, err)
+			return err
+		}
+		// Clear the buffer after successful write.
+		buffers[filename] = nil
+		return nil
+	}
+
+	for {
+		select {
+		case cert, ok := <-certsIn:
+			if !ok {
+				// Channel is closed, flush all remaining buffers and exit.
+				for filename := range buffers {
+					if err := flush(filename); err != nil {
+						// Log the error but continue to try flushing others.
+						log.Printf("Error flushing buffer on exit: %v", err)
+					}
+				}
+				return nil
+			}
+
+			// Determine the target filename for this certificate.
+			blockIndex := (cert.LogEntry.Index / maxEntriesPerFile) * maxEntriesPerFile
+			filename := fmt.Sprintf("%d.data", blockIndex)
+			fullPath := filepath.Join(stateDir, "certs", cert.LogEntry.Log.GetCleanName(), filename)
+
+			// Add the cert to the buffer.
+			buffers[fullPath] = append(buffers[fullPath], cert)
+
+			// If the buffer is full, flush it.
+			if len(buffers[fullPath]) >= flushThreshold {
+				if err := flush(fullPath); err != nil {
+					return err // A persistent write error is fatal for this worker.
+				}
+			}
+
+		case <-ticker.C:
+			// Periodically flush all non-empty buffers.
+			for filename := range buffers {
+				if err := flush(filename); err != nil {
+					return err
+				}
+			}
+
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func newLogClientForProxy(config *Config, ctlog *loglist.Log, proxy string) (ctclient.Log, ctclient.IssuerGetter, error) {
@@ -586,6 +726,30 @@ func newLogClientForProxy(config *Config, ctlog *loglist.Log, proxy string) (ctc
 			}, nil
 	default:
 		return nil, nil, errors.New("log uses unknown protocol")
+	}
+}
+
+func getSTHAndUpdateWorker(ctx context.Context, client ctclient.Log, treeSize *atomic.Uint64) error {
+	ticker := time.NewTicker(getSTHInterval)
+	defer ticker.Stop()
+
+	for {
+		// Do one fetch immediately at the start.
+		sth, _, err := client.GetSTH(ctx)
+		if err != nil {
+			// This is a critical failure at the start, so we exit.
+			// In a more complex scenario, this could also have its own retry logic.
+			return err
+		}
+		// Atomically update the tree size.
+		treeSize.Store(sth.TreeSize)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			// Subsequent fetches happen on the ticker interval.
+		}
 	}
 }
 
@@ -681,77 +845,52 @@ func insertSTH(sths []*StoredSTH, sth *StoredSTH) []*StoredSTH {
 	return slices.Insert(sths, i, sth)
 }
 
-func generateBatchesWorker(ctx context.Context, config *Config, ctlog *loglist.Log, position uint64, sthsIn <-chan *cttypes.SignedTreeHead, batchesOut chan<- *batch) error {
+func generateBatchesWorker(ctx context.Context, ctlog *loglist.Log, position *uint64, latestTreeSize *atomic.Uint64, batchesOut chan<- *batch) error {
+	var batchCounter uint64
+	currentPos := *position
 	downloadJobSize := downloadJobSize(ctlog)
 
-	sths, err := config.State.LoadSTHs(ctx, ctlog.LogID)
-	if err != nil {
-		return fmt.Errorf("error loading STHs: %w", err)
-	}
-	// sths is sorted by TreeSize but may contain STHs with TreeSize < position; get rid of them
-	for len(sths) > 0 && sths[0].TreeSize < position {
-		// TODO-4: audit sths[0] against log's verified STH
-		if err := config.State.RemoveSTH(ctx, ctlog.LogID, &sths[0].SignedTreeHead); err != nil {
-			return fmt.Errorf("error removing STH: %w", err)
-		}
-		sths = sths[1:]
-	}
-	// from this point, sths is sorted by TreeSize and contains only STHs with TreeSize >= position
-	handleSTH := func(sth *cttypes.SignedTreeHead) error {
-		if sth.TreeSize < position {
-			// TODO-4: audit against log's verified STH
-		} else {
-			storedSTH, err := config.State.StoreSTH(ctx, ctlog.LogID, sth)
-			if err != nil {
-				return fmt.Errorf("error storing STH: %w", err)
-			}
-			sths = insertSTH(sths, storedSTH)
-		}
-		return nil
-	}
+	// Use a ticker to periodically check for new work, which is cleaner than a hot loop with sleep.
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
-	var number uint64
 	for {
-		for len(sths) == 0 {
+		// Load the latest known size from the STH worker.
+		targetSize := latestTreeSize.Load()
+
+		// Generate batches as fast as possible until we catch up to the current target size.
+		for currentPos < targetSize {
+			end := currentPos + downloadJobSize
+			if end > targetSize {
+				end = targetSize
+			}
+
+			b := &batch{
+				number: batchCounter,
+				begin:  currentPos,
+				end:    end,
+			}
+
 			select {
 			case <-ctx.Done():
+				// If context is canceled, stop everything immediately.
 				return ctx.Err()
-			case sth := <-sthsIn:
-				if err := handleSTH(sth); err != nil {
-					return err
-				}
+			case batchesOut <- b:
+				// Only advance our position once the batch is accepted by a worker.
+				currentPos = end
+				batchCounter++
 			}
 		}
 
-		batch, remainingSTHs := newBatch(number, position, sths, downloadJobSize)
-
-		if ctlog.IsStaticCTAPI() && batch.end%downloadJobSize != 0 {
-			// Wait to download this partial tile until it's old enough
-			if age := time.Since(batch.discoveredAt); age < maxPartialTileAge {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(maxPartialTileAge - age):
-				case sth := <-sthsIn:
-					if err := handleSTH(sth); err != nil {
-						return err
-					}
-					continue
-				}
-			}
-		}
-
+		// Now that we've caught up to the last known size, wait for either
+		// the context to be canceled or the ticker to fire for the next check.
 		select {
 		case <-ctx.Done():
+			// This is the graceful exit point. If the context is canceled, we're done.
 			return ctx.Err()
-		case sth := <-sthsIn:
-			if err := handleSTH(sth); err != nil {
-				return err
-			}
-		case batchesOut <- batch:
-			number = batch.number + 1
-			position = batch.end
-			sths = remainingSTHs
+		case <-ticker.C:
+			// Ticker fired, loop again to check if latestTreeSize has increased.
+			continue
 		}
 	}
 }
@@ -797,7 +936,7 @@ func downloadWorker(ctx context.Context, pm *ProxyManager, batchesIn <-chan *bat
 func getEntriesWithRetry(ctx context.Context, pm *ProxyManager, start, end uint64) ([]ctclient.Entry, error) {
 	for {
 		// On each attempt, get a new healthy client.
-		client, err := pm.GetClient()
+		client, _, err := pm.GetClient()
 		if err != nil {
 			// All proxies are down, wait before the next attempt.
 			if err := sleep(ctx, 10*time.Second); err != nil {
@@ -805,10 +944,11 @@ func getEntriesWithRetry(ctx context.Context, pm *ProxyManager, start, end uint6
 			}
 			continue
 		}
-
+		pm.IncrementActive()
 		entries, err := client.GetEntries(ctx, start, end)
+		pm.AddCertsProcessed(int64(end - start))
+		pm.DecrementActive()
 		if err == nil {
-			// Success!
 			pm.ReportSuccess(client)
 			return entries, nil
 		}
@@ -827,7 +967,7 @@ func getEntriesWithRetry(ctx context.Context, pm *ProxyManager, start, end uint6
 	}
 }
 
-func processWorker(ctx context.Context, config *Config, ctlog *loglist.Log, issuerGetter ctclient.IssuerGetter, batchesIn <-chan *batch, batchesOut *sequencer.Channel[batch]) error {
+func processWorker(ctx context.Context, config *Config, ctlog *loglist.Log, issuerGetter ctclient.IssuerGetter, batchesIn <-chan *batch, certsToSave chan<- *DiscoveredCert) error {
 	for {
 		var batch *batch
 		select {
@@ -841,22 +981,45 @@ func processWorker(ctx context.Context, config *Config, ctlog *loglist.Log, issu
 				Entry: entry,
 				Index: index,
 				Log:   ctlog,
-			}); err != nil {
+			}, certsToSave); err != nil {
 				return fmt.Errorf("error processing entry %d: %w", index, err)
 			}
-		}
-		if err := batchesOut.Add(ctx, batch.number, batch); err != nil {
-			return err
 		}
 	}
 }
 
-func saveStateWorker(ctx context.Context, config *Config, ctlog *loglist.Log, state *LogState, batchesIn *sequencer.Channel[batch]) error {
+func saveStateWorker(ctx context.Context, config *Config, ctlog *loglist.Log, state *LogState, processedBatches *sequencer.Channel[batch], pm *ProxyManager) error {
+	logTicker := time.NewTicker(20 * time.Second)
+	if !config.Verbose {
+		logTicker.Stop()
+	} else {
+		defer logTicker.Stop()
+	}
+
 	for {
-		batch, err := batchesIn.Next(ctx)
+		select {
+		case <-logTicker.C:
+			log.Printf(
+				"Log: %s | SaveStateWorker: %d batches pending in sequencer.",
+				ctlog.GetCleanName(),
+				processedBatches.Len(),
+			)
+			continue
+		default:
+		}
+
+		batch, err := processedBatches.Next(ctx)
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil // Graceful exit
+			}
 			return err
 		}
+
+		// Update throughput counter
+		batchSize := batch.end - batch.begin
+		pm.AddCertsProcessed(int64(batchSize))
+
 		if batch.begin != state.DownloadPosition.Size() {
 			panic(fmt.Errorf("saveStateWorker: expected batch to start at %d but got %d instead", state.DownloadPosition.Size(), batch.begin))
 		}
@@ -876,7 +1039,6 @@ func saveStateWorker(ctx context.Context, config *Config, ctlog *loglist.Log, st
 				if err := config.State.StoreLogState(ctx, ctlog.LogID, state); err != nil {
 					return fmt.Errorf("error storing log state: %w", err)
 				}
-				// don't remove the STH until state has been durably stored
 				if err := config.State.RemoveSTH(ctx, ctlog.LogID, &sth.SignedTreeHead); err != nil {
 					return fmt.Errorf("error removing verified STH: %w", err)
 				}

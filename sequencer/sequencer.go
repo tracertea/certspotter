@@ -172,3 +172,20 @@ func (seq *Channel[T]) Close() {
 		seq.readReady <- struct{}{}
 	}
 }
+
+// This is an estimate, as it can change concurrently.
+func (seq *Channel[T]) Len() int {
+	seq.mu.Lock()
+	defer seq.mu.Unlock()
+
+	var count int
+	// A rough estimate: count non-nil pointers in the buffer.
+	// This isn't perfectly accurate for the *ordered* length, but gives a
+	// great idea of how full the buffer is.
+	for i := uint64(0); i < seq.Cap(); i++ {
+		if seq.buf[i] != nil {
+			count++
+		}
+	}
+	return count
+}

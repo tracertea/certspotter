@@ -27,19 +27,47 @@ type LogEntry struct {
 	Log   *loglist.Log
 }
 
-func processLogEntry(ctx context.Context, config *Config, issuerGetter ctclient.IssuerGetter, entry *LogEntry) error {
+// processLogEntry now sends the "lite" certificate to a channel for batch saving.
+func processLogEntry(ctx context.Context, config *Config, issuerGetter ctclient.IssuerGetter, entry *LogEntry, certsToSave chan<- *DiscoveredCert) error {
 	leaf, err := cttypes.ParseLeafInput(entry.LeafInput())
 	if err != nil {
 		return processMalformedLogEntry(ctx, config, entry, fmt.Errorf("error parsing Merkle Tree Leaf: %w", err))
 	}
+
+	var rawCert cttypes.ASN1Cert
+
 	switch leaf.TimestampedEntry.EntryType {
 	case cttypes.X509EntryType:
-		return processX509LogEntry(ctx, config, issuerGetter, entry, leaf.TimestampedEntry.SignedEntryASN1Cert)
+		if leaf.TimestampedEntry.SignedEntryASN1Cert == nil {
+			return processMalformedLogEntry(ctx, config, entry, fmt.Errorf("X509 entry is missing certificate data"))
+		}
+		rawCert = *leaf.TimestampedEntry.SignedEntryASN1Cert
+
 	case cttypes.PrecertEntryType:
-		return processPrecertLogEntry(ctx, config, issuerGetter, entry, leaf.TimestampedEntry.SignedEntryPreCert)
+		precertBytes, err := entry.Precertificate()
+		if err != nil {
+			return processMalformedLogEntry(ctx, config, entry, fmt.Errorf("error getting precert entry's precertificate: %w", err))
+		}
+		rawCert = precertBytes
+
 	default:
 		return processMalformedLogEntry(ctx, config, entry, fmt.Errorf("unknown log entry type %d", leaf.TimestampedEntry.EntryType))
 	}
+
+	liteCert := &DiscoveredCert{
+		LogEntry:         entry,
+		rawCertForSaving: rawCert,
+		SHA256:           sha256.Sum256(rawCert),
+	}
+
+	// Send the processed certificate to the save worker channel instead of writing directly.
+	select {
+	case certsToSave <- liteCert:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	return nil
 }
 
 func processX509LogEntry(ctx context.Context, config *Config, issuerGetter ctclient.IssuerGetter, entry *LogEntry, cert *cttypes.ASN1Cert) error {
