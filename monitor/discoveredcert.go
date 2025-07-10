@@ -23,15 +23,16 @@ import (
 )
 
 type DiscoveredCert struct {
-	WatchItem    WatchItem
-	LogEntry     *LogEntry
-	Info         *certspotter.CertInfo
-	Chain        []cttypes.ASN1Cert // first entry is the leaf certificate or precertificate
-	ChainError   error              // any error generating or validating Chain; if non-nil, Chain may be partial or incorrect
-	TBSSHA256    [32]byte           // computed over Info.TBS.Raw
-	SHA256       [32]byte           // computed over Chain[0]
-	PubkeySHA256 [32]byte           // computed over Info.TBS.PublicKey.FullBytes
-	Identifiers  *certspotter.Identifiers
+	WatchItem        WatchItem
+	LogEntry         *LogEntry
+	Info             *certspotter.CertInfo
+	Chain            []cttypes.ASN1Cert // first entry is the leaf certificate or precertificate
+	ChainError       error              // any error generating or validating Chain; if non-nil, Chain may be partial or incorrect
+	TBSSHA256        [32]byte           // computed over Info.TBS.Raw
+	SHA256           [32]byte           // computed over Chain[0]
+	PubkeySHA256     [32]byte           // computed over Info.TBS.PublicKey.FullBytes
+	Identifiers      *certspotter.Identifiers
+	rawCertForSaving cttypes.ASN1Cert
 }
 
 type certPaths struct {
@@ -43,11 +44,14 @@ type certPaths struct {
 func (cert *DiscoveredCert) indexPem() []byte {
 	var buffer bytes.Buffer
 	index := cert.LogEntry.Index
-	if len(cert.Chain) > 0 {
-		certificate := cert.Chain[0]
-		base64Cert := base64.StdEncoding.EncodeToString(certificate)
+
+	// Use the raw cert bytes we stored. This is much more efficient.
+	if len(cert.rawCertForSaving) > 0 {
+		// The certificate is already in DER (binary) format. Base64 encode it.
+		base64Cert := base64.StdEncoding.EncodeToString(cert.rawCertForSaving)
 		fmt.Fprintf(&buffer, "%d %s\n", index, base64Cert)
 	} else {
+		// This case should not be hit in the new flow, but it's safe to keep.
 		fmt.Fprintf(&buffer, "%d <no certificate>\n", index)
 	}
 	return buffer.Bytes()

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tracertea/src/certspotter/ctclient"
@@ -16,10 +17,11 @@ import (
 )
 
 const (
-	failureThreshold  = 3
-	cooldownDuration  = 5 * time.Minute
-	probeInterval     = 1 * time.Minute
-	statusLogInterval = 20 * time.Second // New constant for status logging
+	failureThreshold      = 3
+	cooldownDuration      = 5 * time.Minute
+	probeInterval         = 1 * time.Minute
+	statusLogInterval     = 20 * time.Second // New constant for status logging
+	throughputLogInterval = 20 * time.Second
 )
 
 type proxyState struct {
@@ -33,12 +35,14 @@ type proxyState struct {
 // ProxyManager manages a pool of proxy clients, tracking their health
 // and implementing a circuit breaker pattern.
 type ProxyManager struct {
-	mu           sync.Mutex
-	proxies      []*proxyState
-	next         int // for round-robin
-	config       *Config
-	ctlog        *loglist.Log
-	issuerGetter ctclient.IssuerGetter // The issuer getter is the same for all proxies of a log
+	mu             sync.Mutex
+	proxies        []*proxyState
+	next           int // for round-robin
+	config         *Config
+	ctlog          *loglist.Log
+	issuerGetter   ctclient.IssuerGetter // The issuer getter is the same for all proxies of a log
+	activeRequests atomic.Int64
+	certsProcessed atomic.Int64
 }
 
 // NewProxyManager creates a manager for a set of proxies.
@@ -115,13 +119,73 @@ func NewProxyManager(ctx context.Context, config *Config, ctlog *loglist.Log) (*
 
 	go pm.startProbing(ctx)
 	go pm.startStatusLogger(ctx) // Start the new status logger
+	go pm.startThroughputLogger(ctx)
 
 	return pm, nil
 }
 
+// ADDED: New function to periodically log throughput.
+func (pm *ProxyManager) startThroughputLogger(ctx context.Context) {
+	if !pm.config.Verbose {
+		return
+	}
+
+	ticker := time.NewTicker(throughputLogInterval)
+	defer ticker.Stop()
+
+	var lastCount int64
+	var lastTime time.Time
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case t := <-ticker.C:
+			currentCount := pm.certsProcessed.Load()
+
+			// Don't log on the first tick, just capture the initial state.
+			if !lastTime.IsZero() {
+				elapsed := t.Sub(lastTime).Seconds()
+				processedInInterval := currentCount - lastCount
+
+				// Avoid division by zero if the interval is super short
+				if elapsed > 0 {
+					rate := float64(processedInInterval) / elapsed
+					log.Printf(
+						"Throughput for %s -> Rate: %.2f certs/sec (Processed %d in last %.fs)",
+						pm.ctlog.GetMonitoringURL(),
+						rate,
+						processedInInterval,
+						elapsed,
+					)
+				}
+			}
+
+			// Update state for the next interval.
+			lastCount = currentCount
+			lastTime = t
+		}
+	}
+}
+
+// Method to increment the active request counter.
+func (pm *ProxyManager) IncrementActive() {
+	pm.activeRequests.Add(1)
+}
+
+// Method to decrement the active request counter.
+func (pm *ProxyManager) DecrementActive() {
+	pm.activeRequests.Add(-1)
+}
+
+// ADDED: New method to add a number of processed certs to the counter.
+func (pm *ProxyManager) AddCertsProcessed(count int64) {
+	pm.certsProcessed.Add(count)
+}
+
 // GetClient returns a healthy client from the pool using round-robin.
 // If all proxies are unhealthy, it returns an error.
-func (pm *ProxyManager) GetClient() (ctclient.Log, error) {
+func (pm *ProxyManager) GetClient() (ctclient.Log, string, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -135,13 +199,13 @@ func (pm *ProxyManager) GetClient() (ctclient.Log, error) {
 			//if pm.config.Verbose {
 			//	log.Printf("ProxyManager for %s: providing client for proxy %s", pm.ctlog.GetMonitoringURL(), proxy.address)
 			//}
-			return proxy.client, nil
+			return proxy.client, proxy.address, nil
 		}
 	}
 	if pm.config.Verbose {
 		log.Printf("ProxyManager for %s: no healthy proxies available.", pm.ctlog.GetMonitoringURL())
 	}
-	return nil, errors.New("no healthy proxies available")
+	return nil, "", errors.New("no healthy proxies available")
 }
 
 // GetIssuerGetter returns the issuer getter for this log type.
@@ -251,8 +315,13 @@ func (pm *ProxyManager) logStatus() {
 		}
 		statusStrings = append(statusStrings, fmt.Sprintf("%s: %s, failures: %d/%d", p.address, status, p.failures, failureThreshold))
 	}
-
-	log.Printf("Proxy status for %s -> [ %s ]", pm.ctlog.GetMonitoringURL(), strings.Join(statusStrings, " | "))
+	activeCount := pm.activeRequests.Load()
+	log.Printf(
+		"Proxy status for %s -> Active Requests: %d | [ %s ]",
+		pm.ctlog.GetMonitoringURL(),
+		activeCount,
+		strings.Join(statusStrings, " | "),
+	)
 }
 
 // startStatusLogger runs a loop to periodically log the proxy statuses.

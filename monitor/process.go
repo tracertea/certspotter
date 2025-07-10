@@ -27,19 +27,52 @@ type LogEntry struct {
 	Log   *loglist.Log
 }
 
+// processLogEntry now performs the minimum work required to get the raw certificate.
 func processLogEntry(ctx context.Context, config *Config, issuerGetter ctclient.IssuerGetter, entry *LogEntry) error {
 	leaf, err := cttypes.ParseLeafInput(entry.LeafInput())
 	if err != nil {
+		// We still need to handle malformed entries.
 		return processMalformedLogEntry(ctx, config, entry, fmt.Errorf("error parsing Merkle Tree Leaf: %w", err))
 	}
+
+	var rawCert cttypes.ASN1Cert
+
 	switch leaf.TimestampedEntry.EntryType {
 	case cttypes.X509EntryType:
-		return processX509LogEntry(ctx, config, issuerGetter, entry, leaf.TimestampedEntry.SignedEntryASN1Cert)
+		// For a standard X.509 entry, the raw certificate is directly available.
+		if leaf.TimestampedEntry.SignedEntryASN1Cert == nil {
+			return processMalformedLogEntry(ctx, config, entry, fmt.Errorf("X509 entry is missing certificate data"))
+		}
+		rawCert = *leaf.TimestampedEntry.SignedEntryASN1Cert
+
 	case cttypes.PrecertEntryType:
-		return processPrecertLogEntry(ctx, config, issuerGetter, entry, leaf.TimestampedEntry.SignedEntryPreCert)
+		// For a precert entry, we get the precertificate from the extra_data.
+		// The `Precertificate()` method is efficient and doesn't do full parsing.
+		precertBytes, err := entry.Precertificate()
+		if err != nil {
+			return processMalformedLogEntry(ctx, config, entry, fmt.Errorf("error getting precert entry's precertificate: %w", err))
+		}
+		rawCert = precertBytes
+
 	default:
 		return processMalformedLogEntry(ctx, config, entry, fmt.Errorf("unknown log entry type %d", leaf.TimestampedEntry.EntryType))
 	}
+
+	// We create a "DiscoveredCert" object with only the fields we need for saving.
+	// We no longer populate the expensive fields like Info, Chain, Hashes, etc.
+	liteCert := &DiscoveredCert{
+		LogEntry: entry,
+		// This is the only field we need for the new saving logic.
+		// It contains the raw bytes of the certificate or precertificate.
+		rawCertForSaving: rawCert,
+	}
+
+	// NotifyCert will be updated to handle this "lite" object.
+	if err := config.State.NotifyCert(ctx, liteCert); err != nil {
+		return fmt.Errorf("error notifying about certificate at index %d: %w", entry.Index, err)
+	}
+
+	return nil
 }
 
 func processX509LogEntry(ctx context.Context, config *Config, issuerGetter ctclient.IssuerGetter, entry *LogEntry, cert *cttypes.ASN1Cert) error {
