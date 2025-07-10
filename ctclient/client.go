@@ -42,8 +42,9 @@ func NewHTTPClientWithProxy(proxyURL *url.URL) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			Proxy: proxyFunc,
+			// Set a specific Dial timeout to fail faster on dead hosts
 			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
+				Timeout:   10 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
 			TLSHandshakeTimeout:   15 * time.Second,
@@ -52,13 +53,6 @@ func NewHTTPClientWithProxy(proxyURL *url.URL) *http.Client {
 			IdleConnTimeout:       90 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 			TLSClientConfig: &tls.Config{
-				// We have to disable TLS certificate validation because because several logs
-				// (WoSign, StartCom, GDCA) use certificates that are not widely trusted.
-				// Since we verify that every response we receive from the log is signed
-				// by the log's CT public key (either directly, or indirectly via the Merkle Tree),
-				// TLS certificate validation is not actually necessary.  (We don't want to manage
-				// our own trust store because that adds undesired complexity and would require
-				// updating should a log ever change to a different CA.)
 				InsecureSkipVerify: true,
 			},
 			ForceAttemptHTTP2: true,
@@ -66,7 +60,7 @@ func NewHTTPClientWithProxy(proxyURL *url.URL) *http.Client {
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return errors.New("redirects not followed")
 		},
-		Timeout: 60 * time.Second,
+		Timeout: 60 * time.Second, // Overall request timeout
 	}
 }
 
