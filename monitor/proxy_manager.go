@@ -20,8 +20,8 @@ const (
 	failureThreshold      = 3
 	cooldownDuration      = 5 * time.Minute
 	probeInterval         = 1 * time.Minute
-	statusLogInterval     = 20 * time.Second // New constant for status logging
-	throughputLogInterval = 20 * time.Second
+	statusLogInterval     = 1 * time.Minute // New constant for status logging
+	throughputLogInterval = 1 * time.Minute
 )
 
 type proxyState struct {

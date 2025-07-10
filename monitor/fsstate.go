@@ -124,23 +124,11 @@ func (s *FilesystemState) LoadIssuer(ctx context.Context, fingerprint *[32]byte)
 	}
 }
 
+// NotifyCert is now a placeholder and is no longer called in the hot path.
+// The actual saving logic is in saveCertBatchWorker in monitor.go.
 func (s *FilesystemState) NotifyCert(ctx context.Context, cert *DiscoveredCert) error {
-	//  and remove https:// then replace all non-alphanumeric characters with underscores then remove trailing slashes
-
-	// calculate what file we should save to based on the cert.LogEntry.Index and the s.MaxEntriesPerFile we want the quotient of the division is unint64
-	fileIndex := fmt.Sprintf("%d", (cert.LogEntry.Index/s.MaxEntriesPerFile)*s.MaxEntriesPerFile)
-	prefixPath := filepath.Join(s.StateDir, "certs", cert.LogEntry.Log.GetCleanName())
-	var (
-		jsonFilename = fileIndex + ".data"
-	)
-
-	if err := os.Mkdir(prefixPath, 0777); err != nil && !errors.Is(err, fs.ErrExist) {
-		return fmt.Errorf("error creating directory in which to save certificate %x: %w", cert.SHA256, err)
-	}
-	if err := appendFile(filepath.Join(prefixPath, jsonFilename), cert.indexPem(), 0666); err != nil {
-		return fmt.Errorf("error saving certificate %x: %w", cert.SHA256, err)
-	}
-
+	// This function is no longer responsible for saving certificates.
+	// That is now handled by the saveCertBatchWorker.
 	return nil
 }
 
