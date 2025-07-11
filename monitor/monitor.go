@@ -559,7 +559,7 @@ retry:
 
 	downloadJobSizeVal := downloadJobSize(ctlog)
 	sequencerStart := position / downloadJobSizeVal
-	processedBatches := sequencer.New[batch](sequencerStart, uint64(numDownloaders+numProcessors)*10)
+	processedBatches := sequencer.New[batch](sequencerStart, uint64(numDownloaders+numProcessors)*100)
 
 	// A new errgroup is needed for each retry attempt.
 	group, gctx = errgroup.WithContext(ctx)
@@ -1030,31 +1030,44 @@ func processWorker(ctx context.Context, config *Config, ctlog *loglist.Log, issu
 }
 
 func saveStateWorker(ctx context.Context, config *Config, ctlog *loglist.Log, state *LogState, processedBatches *sequencer.Channel[batch], pm *ProxyManager) error {
-	logTicker := time.NewTicker(20 * time.Second)
-	if !config.Verbose {
-		logTicker.Stop()
-	} else {
-		defer logTicker.Stop()
-	}
+	// Constants for controlling how often we save state to disk.
+	const saveInterval = 15 * time.Second // Save at least this often.
+	const saveBatchInterval = 100         // Save after this many batches.
 
-	for {
+	saveTicker := time.NewTicker(saveInterval)
+	defer saveTicker.Stop()
+
+	batchesSinceSave := 0
+	var finalSave bool
+
+	for !finalSave {
+		var batch *batch
+		var err error
+
+		// Non-blockingly check for a new batch.
+		// We use a select so we can also check the save ticker and context cancellation.
 		select {
-		case <-logTicker.C:
-			log.Printf(
-				"Log: %s | SaveStateWorker: %d batches pending in sequencer.",
-				ctlog.GetCleanName(),
-				processedBatches.Len(),
-			)
-			continue
-		default:
-		}
-
-		batch, err := processedBatches.Next(ctx)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil // Graceful exit
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-saveTicker.C:
+			// Time-based trigger to save the state.
+			if batchesSinceSave > 0 {
+				if err := config.State.StoreLogState(ctx, ctlog.LogID, state); err != nil {
+					return fmt.Errorf("error storing log state on timer: %w", err)
+				}
+				batchesSinceSave = 0
 			}
-			return err
+			continue // Go back to waiting for a batch.
+		default:
+			// No other event, so now we block waiting for the next processed batch.
+			batch, err = processedBatches.Next(ctx)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					finalSave = true // Sequencer is closed, we must do one final save and exit.
+					break
+				}
+				return err
+			}
 		}
 
 		// Update throughput counter
@@ -1077,9 +1090,7 @@ func saveStateWorker(ctx context.Context, config *Config, ctlog *loglist.Log, st
 				state.advanceVerifiedPosition()
 				state.LastSuccess = sth.StoredAt
 				state.VerifiedSTH = &sth.SignedTreeHead
-				if err := config.State.StoreLogState(ctx, ctlog.LogID, state); err != nil {
-					return fmt.Errorf("error storing log state: %w", err)
-				}
+				// Note: We don't save state here anymore, just update in-memory.
 				if err := config.State.RemoveSTH(ctx, ctlog.LogID, &sth.SignedTreeHead); err != nil {
 					return fmt.Errorf("error removing verified STH: %w", err)
 				}
@@ -1096,10 +1107,21 @@ func saveStateWorker(ctx context.Context, config *Config, ctlog *loglist.Log, st
 			state.DownloadPosition.Add(leafHash)
 		}
 
-		if err := config.State.StoreLogState(ctx, ctlog.LogID, state); err != nil {
-			return fmt.Errorf("error storing log state: %w", err)
+		batchesSinceSave++
+		if batchesSinceSave >= saveBatchInterval {
+			if err := config.State.StoreLogState(ctx, ctlog.LogID, state); err != nil {
+				return fmt.Errorf("error storing log state after batch interval: %w", err)
+			}
+			batchesSinceSave = 0
 		}
 	}
+
+	// Perform one final save to ensure the very last batches are committed.
+	if err := config.State.StoreLogState(ctx, ctlog.LogID, state); err != nil {
+		return fmt.Errorf("error performing final log state store: %w", err)
+	}
+
+	return nil
 }
 
 func sleep(ctx context.Context, duration time.Duration) error {
