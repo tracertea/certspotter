@@ -143,14 +143,20 @@ func (ctlog *RFC6962Log) reconstructTree(ctx context.Context, treeSize uint64) (
 	return tree, nil
 }
 
+var zeroHash merkletree.Hash // A zero-value [32]byte array
+
 func (ctlog *RFC6962Log) ReconstructTree(ctx context.Context, sth *cttypes.SignedTreeHead) (*merkletree.CollapsedTree, error) {
 	tree, err := ctlog.reconstructTree(ctx, sth.TreeSize)
 	if err != nil {
 		return nil, err
 	}
 
-	if rootHash := tree.CalculateRoot(); rootHash != sth.RootHash {
-		return nil, fmt.Errorf("calculated root hash (%s) does not match STH (%s) at size %d", rootHash.Base64String(), sth.RootHash.Base64String(), sth.TreeSize)
+	// If the provided STH has a zero hash, it's a dummy for reconstruction.
+	// In this case, we skip verification and trust the reconstructed tree.
+	if sth.RootHash != zeroHash {
+		if rootHash := tree.CalculateRoot(); rootHash != sth.RootHash {
+			return nil, fmt.Errorf("calculated root hash (%s) does not match STH (%s) at size %d", rootHash.Base64String(), sth.RootHash.Base64String(), sth.TreeSize)
+		}
 	}
 
 	return tree, nil
