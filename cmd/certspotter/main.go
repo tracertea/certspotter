@@ -271,13 +271,22 @@ func main() {
 		}
 	}()
 
-	if err := monitor.Run(ctx, config); ctx.Err() == context.Canceled && errors.Is(err, context.Canceled) {
+	runErr := monitor.Run(ctx, config)
+
+	// **** THE FIX: More robust exit logic ****
+	// Check if the context was canceled first. This indicates a graceful shutdown request.
+	if ctx.Err() == context.Canceled {
 		if flags.verbose {
 			fmt.Fprintf(os.Stderr, "%s: exiting due to SIGINT or SIGTERM\n", programName)
 		}
+		// Any error returned by monitor.Run during a graceful shutdown is likely
+		// a result of the cancellation, so we can exit cleanly.
 		os.Exit(0)
-	} else {
-		fmt.Fprintf(os.Stderr, "%s: %s\n", programName, err)
+	}
+
+	// If the context was not canceled, any error is a real problem.
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "%s: %s\n", programName, runErr)
 		os.Exit(1)
 	}
 }

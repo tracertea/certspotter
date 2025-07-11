@@ -436,14 +436,11 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 			log.Printf("%s: resuming monitoring from position %d", ctlog.GetMonitoringURL(), startPosition)
 		}
 	} else {
-		// This 'else' block handles initialization for new logs or when resuming from a file.
 		var initialTree *merkletree.CollapsedTree
-
 		if resumeIndex, ok := config.ResumePoints[ctlog.GetCleanName()]; ok {
 			log.Printf("No state file for %s, resuming from index %d specified in resume file.", ctlog.GetCleanName(), resumeIndex)
 			startPosition = resumeIndex
 		} else if config.StartAtEnd {
-			// This logic remains the same: get the latest STH to find the end.
 			client, clientErr := proxyManager.GetClient(ctx)
 			if clientErr != nil {
 				return fmt.Errorf("failed to get initial client for start_at_end: %w", clientErr)
@@ -464,15 +461,12 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 				return sthErr
 			}
 		}
-		// If startPosition is 0, we start with an empty tree.
 		if startPosition == 0 {
 			if config.Verbose {
 				log.Printf("%s: monitoring new log from beginning", ctlog.GetMonitoringURL())
 			}
 			initialTree = merkletree.EmptyCollapsedTree()
 		} else {
-			// **** THE FIX: Efficiently reconstruct the tree state ****
-			// Instead of calling AddHashes, use the log's API.
 			if config.Verbose {
 				log.Printf("%s: monitoring new log starting from position %d, reconstructing tree state...", ctlog.GetMonitoringURL(), startPosition)
 			}
@@ -484,17 +478,15 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 			var duration time.Duration
 			func() {
 				startTime := time.Now()
-				// We need a dummy STH with the target tree size to pass to ReconstructTree
 				dummySTH := &cttypes.SignedTreeHead{TreeSize: startPosition}
 				initialTree, reconErr = client.ReconstructTree(ctx, dummySTH)
 				duration = time.Since(startTime)
 			}()
-
 			if reconErr != nil {
-				proxyManager.ReleaseClient(client, nil) // Failure
+				proxyManager.ReleaseClient(client, nil)
 				return fmt.Errorf("could not reconstruct tree state to position %d: %w", startPosition, reconErr)
 			}
-			proxyManager.ReleaseClient(client, &duration) // Success
+			proxyManager.ReleaseClient(client, &duration)
 			if config.Verbose {
 				log.Printf("%s: tree reconstruction complete.", ctlog.GetMonitoringURL())
 			}
@@ -512,28 +504,16 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 		}
 	}
 
-	defer func() {
-		storeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		if err := config.State.StoreLogState(storeCtx, ctlog.LogID, state); err != nil && returnedErr == nil {
-			returnedErr = fmt.Errorf("error storing log state: %w", err)
-		}
-	}()
-
-	// Channel for certificates ready to be saved. Buffered to absorb bursts.
 	certsToSave := make(chan *DiscoveredCert, 2048)
-
 	group, gctx := errgroup.WithContext(ctx)
 
-	// Start the new batch-saving worker.
 	fsState, _ := config.State.(*FilesystemState)
 	group.Go(func() error {
 		return saveCertBatchWorker(gctx, certsToSave, fsState.StateDir, fsState.MaxEntriesPerFile)
 	})
 
 retry:
-	position := startPosition // Use the determined start position for this run.
-
+	position := startPosition
 	var latestTreeSize atomic.Uint64
 	if state.VerifiedSTH != nil {
 		latestTreeSize.Store(state.VerifiedSTH.TreeSize)
@@ -556,15 +536,12 @@ retry:
 
 	batchesToDownload := make(chan *batch, numDownloaders)
 	batchesToProcess := make(chan *batch, numDownloaders)
-
 	downloadJobSizeVal := downloadJobSize(ctlog)
 	sequencerStart := position / downloadJobSizeVal
-	processedBatches := sequencer.New[batch](sequencerStart, uint64(numDownloaders+numProcessors)*100)
+	processedBatches := sequencer.New[batch](sequencerStart, uint64(numDownloaders+numProcessors)*10)
 
-	// A new errgroup is needed for each retry attempt.
-	group, gctx = errgroup.WithContext(ctx)
+	group, gctx = errgroup.WithContext(gctx)
 
-	// The STH worker now manages its own client acquisition from the pool.
 	group.Go(func() error {
 		return getSTHAndUpdateWorker(gctx, proxyManager, &latestTreeSize)
 	})
@@ -620,7 +597,7 @@ retry:
 		}
 		goto retry
 	}
-	close(certsToSave) // Signal the save worker to finish when the main group is done.
+	close(certsToSave)
 	return err
 }
 
