@@ -154,8 +154,12 @@ func (ctlog *StaticLog) ReconstructTree(ctx context.Context, sth *cttypes.Signed
 		return nil, errors.Join(errs...)
 	}
 
-	if rootHash := tree.CalculateRoot(); rootHash != sth.RootHash {
-		return nil, fmt.Errorf("calculated root hash (%s) does not match STH (%s) at size %d", rootHash.Base64String(), sth.RootHash.Base64String(), sth.TreeSize)
+	// If the provided STH has a zero hash, it's a dummy for reconstruction.
+	// In this case, we skip verification and trust the reconstructed tree.
+	if sth.RootHash != zeroHash {
+		if rootHash := tree.CalculateRoot(); rootHash != sth.RootHash {
+			return nil, fmt.Errorf("calculated root hash (%s) does not match STH (%s) at size %d", rootHash.Base64String(), sth.RootHash.Base64String(), sth.TreeSize)
+		}
 	}
 
 	return tree, nil

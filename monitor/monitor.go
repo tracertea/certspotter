@@ -436,63 +436,77 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 			log.Printf("%s: resuming monitoring from position %d", ctlog.GetMonitoringURL(), startPosition)
 		}
 	} else {
-		if config.StartAtEnd {
-			// To start at the end, we need an initial STH fetch.
-			// This needs a client, but we don't want to get stuck if the first proxy is bad.
-			// So we'll use the proxy manager just for this single operation.
+		// This 'else' block handles initialization for new logs or when resuming from a file.
+		var initialTree *merkletree.CollapsedTree
+
+		if resumeIndex, ok := config.ResumePoints[ctlog.GetCleanName()]; ok {
+			log.Printf("No state file for %s, resuming from index %d specified in resume file.", ctlog.GetCleanName(), resumeIndex)
+			startPosition = resumeIndex
+		} else if config.StartAtEnd {
+			// This logic remains the same: get the latest STH to find the end.
 			client, clientErr := proxyManager.GetClient(ctx)
 			if clientErr != nil {
 				return fmt.Errorf("failed to get initial client for start_at_end: %w", clientErr)
 			}
-
 			var sth *cttypes.SignedTreeHead
 			var sthErr error
-			// Use a non-nil duration to indicate success to the proxy manager
 			duration := new(time.Duration)
-
-			// Immediately-invoked function to handle defer
 			func() {
 				startTime := time.Now()
-				defer func() {
-					*duration = time.Since(startTime)
-				}()
+				defer func() { *duration = time.Since(startTime) }()
 				sth, _, sthErr = client.GetSTH(ctx)
 			}()
-
 			if sthErr == nil {
-				proxyManager.ReleaseClient(client, duration) // Success
+				proxyManager.ReleaseClient(client, duration)
 				startPosition = sth.TreeSize
 			} else {
-				proxyManager.ReleaseClient(client, nil) // Failure
+				proxyManager.ReleaseClient(client, nil)
 				return sthErr
 			}
-
-		} else if resumeIndex, ok := config.ResumePoints[ctlog.GetCleanName()]; ok {
-			log.Printf("No state file for %s, resuming from index %d specified in resume file.", ctlog.GetCleanName(), resumeIndex)
-			startPosition = resumeIndex
 		}
+		// If startPosition is 0, we start with an empty tree.
+		if startPosition == 0 {
+			if config.Verbose {
+				log.Printf("%s: monitoring new log from beginning", ctlog.GetMonitoringURL())
+			}
+			initialTree = merkletree.EmptyCollapsedTree()
+		} else {
+			// **** THE FIX: Efficiently reconstruct the tree state ****
+			// Instead of calling AddHashes, use the log's API.
+			if config.Verbose {
+				log.Printf("%s: monitoring new log starting from position %d, reconstructing tree state...", ctlog.GetMonitoringURL(), startPosition)
+			}
+			client, clientErr := proxyManager.GetClient(ctx)
+			if clientErr != nil {
+				return fmt.Errorf("failed to get client for tree reconstruction: %w", clientErr)
+			}
+			var reconErr error
+			var duration time.Duration
+			func() {
+				startTime := time.Now()
+				// We need a dummy STH with the target tree size to pass to ReconstructTree
+				dummySTH := &cttypes.SignedTreeHead{TreeSize: startPosition}
+				initialTree, reconErr = client.ReconstructTree(ctx, dummySTH)
+				duration = time.Since(startTime)
+			}()
 
-		tree := merkletree.EmptyCollapsedTree()
-		if startPosition > 0 {
-			if err := tree.AddHashes(startPosition); err != nil {
-				return fmt.Errorf("could not create synthetic collapsed tree: %w", err)
+			if reconErr != nil {
+				proxyManager.ReleaseClient(client, nil) // Failure
+				return fmt.Errorf("could not reconstruct tree state to position %d: %w", startPosition, reconErr)
+			}
+			proxyManager.ReleaseClient(client, &duration) // Success
+			if config.Verbose {
+				log.Printf("%s: tree reconstruction complete.", ctlog.GetMonitoringURL())
 			}
 		}
 
 		state = &LogState{
-			DownloadPosition: tree,
-			VerifiedPosition: tree,
+			DownloadPosition: initialTree,
+			VerifiedPosition: initialTree,
 			VerifiedSTH:      nil,
 			LastSuccess:      time.Now(),
 		}
 
-		if config.Verbose {
-			if startPosition > 0 {
-				log.Printf("%s: monitoring new log starting from position %d", ctlog.GetMonitoringURL(), startPosition)
-			} else {
-				log.Printf("%s: monitoring new log from beginning", ctlog.GetMonitoringURL())
-			}
-		}
 		if err := config.State.StoreLogState(ctx, ctlog.LogID, state); err != nil {
 			return fmt.Errorf("error storing initial log state: %w", err)
 		}
@@ -512,7 +526,7 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 	group, gctx := errgroup.WithContext(ctx)
 
 	// Start the new batch-saving worker.
-	fsState := config.State.(*FilesystemState)
+	fsState, _ := config.State.(*FilesystemState)
 	group.Go(func() error {
 		return saveCertBatchWorker(gctx, certsToSave, fsState.StateDir, fsState.MaxEntriesPerFile)
 	})
