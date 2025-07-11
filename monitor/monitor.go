@@ -445,10 +445,12 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 		return fmt.Errorf("error loading log state: %w", err)
 	}
 	if state == nil {
-		client, _, err := proxyManager.GetClient()
+		client, err := proxyManager.GetClient(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to get initial client: %w", err)
 		}
+		defer proxyManager.ReleaseClient(client, nil)
+
 		if config.StartAtEnd {
 			sth, _, err := client.GetSTH(ctx)
 			if err != nil {
@@ -533,10 +535,11 @@ retry:
 	// A new errgroup is needed for each retry attempt.
 	group, gctx = errgroup.WithContext(ctx)
 
-	client, _, err := proxyManager.GetClient()
+	client, err := proxyManager.GetClient(gctx)
 	if err != nil {
 		return fmt.Errorf("no proxies available to start STH worker: %w", err)
 	}
+	defer proxyManager.ReleaseClient(client, nil)
 
 	group.Go(func() error { return getSTHAndUpdateWorker(gctx, client, &latestTreeSize) })
 
@@ -565,14 +568,13 @@ retry:
 	for i := 0; i < numProcessors; i++ {
 		group.Go(func() error {
 			defer processWg.Done()
-			return processWorker(gctx, config, ctlog, issuerGetter, batchesToProcess, certsToSave)
+			return processWorker(gctx, config, ctlog, issuerGetter, batchesToProcess, certsToSave, processedBatches)
 		})
 	}
 
 	group.Go(func() error {
 		processWg.Wait()
-		// No longer closing batchesToProcess here, it's handled by the download coordinator.
-		// We also don't close processedBatches here. It's closed by the saveStateWorker.
+		processedBatches.Close()
 		return nil
 	})
 
@@ -895,33 +897,31 @@ func generateBatchesWorker(ctx context.Context, ctlog *loglist.Log, position *ui
 	}
 }
 
-// downloadWorker is now much smarter. It doesn't requeue work, but instead
-// tries to complete its assigned batch using any available healthy proxy.
 func downloadWorker(ctx context.Context, pm *ProxyManager, batchesIn <-chan *batch, batchesOut chan<- *batch) error {
-	for {
-		var batch *batch
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case batch = <-batchesIn:
-		}
-
-		allEntries := make([]ctclient.Entry, 0, batch.end-batch.begin)
-		currentPos := batch.begin
-
-		// This is the new pagination loop.
-		for currentPos < batch.end {
-			// Fetch one page of entries with robust retry logic.
-			pageEntries, err := getEntriesWithRetry(ctx, pm, currentPos, batch.end-1)
-			if err != nil {
-				// If this fails permanently, the entire log monitoring will stop.
+	for batch := range batchesIn {
+		client, err := pm.GetClient(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
 				return err
 			}
-			allEntries = append(allEntries, pageEntries...)
-			currentPos += uint64(len(pageEntries))
+			log.Printf("Download worker for %s could not get a client, retrying batch later. Error: %v", pm.ctlog.GetMonitoringURL(), err)
+			time.Sleep(5 * time.Second) // back-off before retrying
+			continue
 		}
 
-		batch.entries = allEntries
+		startTime := time.Now()
+		entries, err := client.GetEntries(ctx, batch.begin, batch.end-1)
+		duration := time.Since(startTime)
+
+		if err != nil {
+			pm.ReleaseClient(client, nil)
+			recordError(ctx, pm.config, pm.ctlog, err)
+			continue
+		}
+
+		pm.ReleaseClient(client, &duration)
+
+		batch.entries = entries
 
 		select {
 		case <-ctx.Done():
@@ -929,52 +929,11 @@ func downloadWorker(ctx context.Context, pm *ProxyManager, batchesIn <-chan *bat
 		case batchesOut <- batch:
 		}
 	}
+	return nil
 }
 
-// getEntriesWithRetry handles the entire lifecycle of fetching a page of entries,
-// including handling proxy failures and retries for that specific page.
-func getEntriesWithRetry(ctx context.Context, pm *ProxyManager, start, end uint64) ([]ctclient.Entry, error) {
-	for {
-		// On each attempt, get a new healthy client.
-		client, _, err := pm.GetClient()
-		if err != nil {
-			// All proxies are down, wait before the next attempt.
-			if err := sleep(ctx, 10*time.Second); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		pm.IncrementActive()
-		entries, err := client.GetEntries(ctx, start, end)
-		pm.AddCertsProcessed(int64(end - start))
-		pm.DecrementActive()
-		if err == nil {
-			pm.ReportSuccess(client)
-			return entries, nil
-		}
-
-		// Failure, report it. The loop will continue and try another proxy.
-		pm.ReportFailure(client)
-		recordError(ctx, pm.config, pm.ctlog, err)
-
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		// Brief sleep to prevent a tight loop if all proxies fail quickly.
-		if err := sleep(ctx, 1*time.Second); err != nil {
-			return nil, err
-		}
-	}
-}
-
-func processWorker(ctx context.Context, config *Config, ctlog *loglist.Log, issuerGetter ctclient.IssuerGetter, batchesIn <-chan *batch, certsToSave chan<- *DiscoveredCert) error {
-	for {
-		var batch *batch
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case batch = <-batchesIn:
-		}
+func processWorker(ctx context.Context, config *Config, ctlog *loglist.Log, issuerGetter ctclient.IssuerGetter, batchesIn <-chan *batch, certsToSave chan<- *DiscoveredCert, processedBatches *sequencer.Channel[batch]) error {
+	for batch := range batchesIn {
 		for offset, entry := range batch.entries {
 			index := batch.begin + uint64(offset)
 			if err := processLogEntry(ctx, config, issuerGetter, &LogEntry{
@@ -985,7 +944,11 @@ func processWorker(ctx context.Context, config *Config, ctlog *loglist.Log, issu
 				return fmt.Errorf("error processing entry %d: %w", index, err)
 			}
 		}
+		if err := processedBatches.Add(ctx, batch.number, batch); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func saveStateWorker(ctx context.Context, config *Config, ctlog *loglist.Log, state *LogState, processedBatches *sequencer.Channel[batch], pm *ProxyManager) error {

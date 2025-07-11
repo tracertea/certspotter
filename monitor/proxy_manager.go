@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,28 +21,38 @@ const (
 	failureThreshold      = 3
 	cooldownDuration      = 5 * time.Minute
 	probeInterval         = 1 * time.Minute
-	statusLogInterval     = 1 * time.Minute // New constant for status logging
+	statusLogInterval     = 1 * time.Minute
 	throughputLogInterval = 1 * time.Minute
+	maxResponseTimes      = 100
+	rateLimitWindow       = 5 * time.Minute
+	defaultSlotsPerProxy  = 4
 )
 
 type proxyState struct {
-	client        ctclient.Log
-	address       string // For logging
-	failures      int
-	isUnhealthy   bool
-	cooldownUntil time.Time
+	client             ctclient.Log
+	address            string
+	isUnhealthy        bool
+	cooldownUntil      time.Time
+	failures           int
+	requestsCompleted  atomic.Int64
+	lastLoggedRequests int64
+	// Metrics
+	responseTimes   []time.Duration
+	responseTimesMu sync.Mutex
+	recent429s      []time.Time
+	recent429sMu    sync.Mutex
+	// Concurrency control
+	requestSlots chan struct{}
 }
 
 // ProxyManager manages a pool of proxy clients, tracking their health
-// and implementing a circuit breaker pattern.
+// and implementing adaptive concurrency limiting.
 type ProxyManager struct {
 	mu             sync.Mutex
 	proxies        []*proxyState
-	next           int // for round-robin
+	issuerGetter   ctclient.IssuerGetter
 	config         *Config
 	ctlog          *loglist.Log
-	issuerGetter   ctclient.IssuerGetter // The issuer getter is the same for all proxies of a log
-	activeRequests atomic.Int64
 	certsProcessed atomic.Int64
 }
 
@@ -54,7 +65,12 @@ func NewProxyManager(ctx context.Context, config *Config, ctlog *loglist.Log) (*
 
 	proxies := config.Proxies
 	if len(proxies) == 0 {
-		proxies = []string{""} // Add an empty proxy for direct connection
+		proxies = []string{""} // Direct connection
+	}
+
+	slotsCount := defaultSlotsPerProxy
+	if ctlog.CertspotterDownloadJobs > 0 {
+		slotsCount = ctlog.CertspotterDownloadJobs
 	}
 
 	for _, proxyAddr := range proxies {
@@ -68,7 +84,6 @@ func NewProxyManager(ctx context.Context, config *Config, ctlog *loglist.Log) (*
 		}
 
 		httpClient := ctclient.NewHTTPClientWithProxy(proxyURL)
-
 		var client ctclient.Log
 		var currentIssuerGetter ctclient.IssuerGetter
 
@@ -76,7 +91,7 @@ func NewProxyManager(ctx context.Context, config *Config, ctlog *loglist.Log) (*
 		case ctlog.IsRFC6962():
 			logURL, err := url.Parse(ctlog.URL)
 			if err != nil {
-				return nil, fmt.Errorf("log has invalid URL: %w", err)
+				return nil, fmt.Errorf("invalid log URL: %w", err)
 			}
 			client = &ctclient.RFC6962Log{URL: logURL, HTTPClient: httpClient}
 		case ctlog.IsStaticCTAPI():
@@ -103,142 +118,139 @@ func NewProxyManager(ctx context.Context, config *Config, ctlog *loglist.Log) (*
 			addrForLog = proxyAddr
 		}
 
+		slots := make(chan struct{}, slotsCount)
+		for i := 0; i < slotsCount; i++ {
+			slots <- struct{}{}
+		}
+
 		pm.proxies = append(pm.proxies, &proxyState{
-			client:  &logClient{config: config, log: ctlog, client: client},
-			address: addrForLog,
+			client:       &logClient{config: config, log: ctlog, client: client},
+			address:      addrForLog,
+			requestSlots: slots,
 		})
 
-		// All proxies for a log share the same issuerGetter logic, so we only need to set it once.
 		if pm.issuerGetter == nil {
 			pm.issuerGetter = currentIssuerGetter
 		}
 	}
+
 	if config.Verbose {
-		log.Printf("ProxyManager for %s initialized with %d proxies.", ctlog.GetMonitoringURL(), len(pm.proxies))
+		log.Printf("ProxyManager for %s initialized with %d proxies, each with %d slots.", ctlog.GetMonitoringURL(), len(pm.proxies), slotsCount)
 	}
 
 	go pm.startProbing(ctx)
-	go pm.startStatusLogger(ctx) // Start the new status logger
+	go pm.startStatusLogger(ctx)
 	go pm.startThroughputLogger(ctx)
 
 	return pm, nil
 }
 
-// ADDED: New function to periodically log throughput.
-func (pm *ProxyManager) startThroughputLogger(ctx context.Context) {
-	if !pm.config.Verbose {
-		return
+func (p *proxyState) rollingAverage() time.Duration {
+	p.responseTimesMu.Lock()
+	defer p.responseTimesMu.Unlock()
+	if len(p.responseTimes) == 0 {
+		return 0
 	}
+	var sum time.Duration
+	for _, d := range p.responseTimes {
+		sum += d
+	}
+	return sum / time.Duration(len(p.responseTimes))
+}
 
-	ticker := time.NewTicker(throughputLogInterval)
-	defer ticker.Stop()
+func (p *proxyState) count429s(interval time.Duration) int {
+	p.recent429sMu.Lock()
+	defer p.recent429sMu.Unlock()
+	cutoff := time.Now().Add(-interval)
+	n := 0
+	for i, t := range p.recent429s {
+		if t.After(cutoff) {
+			p.recent429s[n] = p.recent429s[i]
+			n++
+		}
+	}
+	p.recent429s = p.recent429s[:n]
+	return n
+}
 
-	var lastCount int64
-	var lastTime time.Time
+// GetClient blocks until a request slot is available from any healthy proxy.
+// It returns the client to use. The caller MUST call ReleaseClient when done.
+func (pm *ProxyManager) GetClient(ctx context.Context) (ctclient.Log, error) {
+	pm.mu.Lock()
+	cases := []reflect.SelectCase{{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())}}
+	proxyMap := make(map[int]*proxyState)
 
-	for {
+	for _, p := range pm.proxies {
+		if !p.isUnhealthy {
+			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(p.requestSlots)})
+			proxyMap[len(cases)-1] = p
+		}
+	}
+	pm.mu.Unlock()
+
+	if len(proxyMap) == 0 {
+		if pm.config.Verbose {
+			log.Printf("ProxyManager for %s: All proxies are unhealthy. Waiting for recovery.", pm.ctlog.GetMonitoringURL())
+		}
 		select {
+		case <-time.After(probeInterval):
+			return pm.GetClient(ctx)
 		case <-ctx.Done():
-			return
-		case t := <-ticker.C:
-			currentCount := pm.certsProcessed.Load()
-
-			// Don't log on the first tick, just capture the initial state.
-			if !lastTime.IsZero() {
-				elapsed := t.Sub(lastTime).Seconds()
-				processedInInterval := currentCount - lastCount
-
-				// Avoid division by zero if the interval is super short
-				if elapsed > 0 {
-					rate := float64(processedInInterval) / elapsed
-					log.Printf(
-						"Throughput for %s -> Rate: %.2f certs/sec (Processed %d in last %.fs)",
-						pm.ctlog.GetMonitoringURL(),
-						rate,
-						processedInInterval,
-						elapsed,
-					)
-				}
-			}
-
-			// Update state for the next interval.
-			lastCount = currentCount
-			lastTime = t
+			return nil, ctx.Err()
 		}
 	}
-}
 
-// Method to increment the active request counter.
-func (pm *ProxyManager) IncrementActive() {
-	pm.activeRequests.Add(1)
-}
+	chosen, _, _ := reflect.Select(cases)
 
-// Method to decrement the active request counter.
-func (pm *ProxyManager) DecrementActive() {
-	pm.activeRequests.Add(-1)
-}
-
-// ADDED: New method to add a number of processed certs to the counter.
-func (pm *ProxyManager) AddCertsProcessed(count int64) {
-	pm.certsProcessed.Add(count)
-}
-
-// GetClient returns a healthy client from the pool using round-robin.
-// If all proxies are unhealthy, it returns an error.
-func (pm *ProxyManager) GetClient() (ctclient.Log, string, error) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	for i := 0; i < len(pm.proxies); i++ {
-		// Round-robin to find the next healthy proxy
-		idx := (pm.next + i) % len(pm.proxies)
-		proxy := pm.proxies[idx]
-
-		if !proxy.isUnhealthy {
-			pm.next = (idx + 1) % len(pm.proxies)
-			//if pm.config.Verbose {
-			//	log.Printf("ProxyManager for %s: providing client for proxy %s", pm.ctlog.GetMonitoringURL(), proxy.address)
-			//}
-			return proxy.client, proxy.address, nil
-		}
+	if chosen == 0 { // Context was canceled
+		return nil, ctx.Err()
 	}
-	if pm.config.Verbose {
-		log.Printf("ProxyManager for %s: no healthy proxies available.", pm.ctlog.GetMonitoringURL())
-	}
-	return nil, "", errors.New("no healthy proxies available")
+
+	proxy := proxyMap[chosen]
+	return proxy.client, nil
 }
 
-// GetIssuerGetter returns the issuer getter for this log type.
-func (pm *ProxyManager) GetIssuerGetter() ctclient.IssuerGetter {
-	return pm.issuerGetter
-}
-
-// ReportFailure is called by a worker when a request fails.
-func (pm *ProxyManager) ReportFailure(failedClient ctclient.Log) {
+// ReleaseClient returns a request slot to the proxy it came from and reports success or failure.
+// Pass a non-nil duration on success, or nil on failure.
+func (pm *ProxyManager) ReleaseClient(client ctclient.Log, duration *time.Duration) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
 	for _, p := range pm.proxies {
-		if p.client == failedClient {
-			// If the proxy is already marked unhealthy, this failure is from an
-			// in-flight request that started before the circuit was tripped.
-			// We can log it but don't need to increment the failure count.
-			if p.isUnhealthy {
-				if pm.config.Verbose {
-					log.Printf("ProxyManager for %s: received failure report for already unhealthy proxy %s (in-flight request). Ignoring.", pm.ctlog.GetMonitoringURL(), p.address)
-				}
-				return
-			}
+		if p.client == client {
+			p.requestSlots <- struct{}{}
 
-			p.failures++
-			if pm.config.Verbose {
-				log.Printf("ProxyManager for %s: failure reported for proxy %s. Failure count: %d/%d", pm.ctlog.GetMonitoringURL(), p.address, p.failures, failureThreshold)
-			}
-			if p.failures >= failureThreshold {
-				p.isUnhealthy = true
-				p.cooldownUntil = time.Now().Add(cooldownDuration)
+			if duration != nil { // Success case
+				p.requestsCompleted.Add(1)
+				if p.failures > 0 {
+					p.failures = 0
+				}
+				if p.isUnhealthy {
+					if pm.config.Verbose {
+						log.Printf("ProxyManager for %s: proxy %s marked as HEALTHY again.", pm.ctlog.GetMonitoringURL(), p.address)
+					}
+					p.isUnhealthy = false
+				}
+				p.responseTimesMu.Lock()
+				p.responseTimes = append(p.responseTimes, *duration)
+				if len(p.responseTimes) > maxResponseTimes {
+					p.responseTimes = p.responseTimes[1:]
+				}
+				p.responseTimesMu.Unlock()
+			} else { // Failure case
+				if p.isUnhealthy {
+					return
+				}
+				p.failures++
 				if pm.config.Verbose {
-					log.Printf("ProxyManager for %s: proxy %s marked as UNHEALTHY. Cooling down until %s.", pm.ctlog.GetMonitoringURL(), p.address, p.cooldownUntil.Format(time.RFC3339))
+					log.Printf("ProxyManager for %s: failure reported for proxy %s. Failure count: %d/%d", pm.ctlog.GetMonitoringURL(), p.address, p.failures, failureThreshold)
+				}
+				if p.failures >= failureThreshold {
+					p.isUnhealthy = true
+					p.cooldownUntil = time.Now().Add(cooldownDuration)
+					if pm.config.Verbose {
+						log.Printf("ProxyManager for %s: proxy %s marked as UNHEALTHY. Cooling down until %s.", pm.ctlog.GetMonitoringURL(), p.address, p.cooldownUntil.Format(time.RFC3339))
+					}
 				}
 			}
 			return
@@ -246,38 +258,9 @@ func (pm *ProxyManager) ReportFailure(failedClient ctclient.Log) {
 	}
 }
 
-// ReportSuccess is called by a worker when a request succeeds.
-func (pm *ProxyManager) ReportSuccess(succeededClient ctclient.Log) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	for _, p := range pm.proxies {
-		if p.client == succeededClient {
-			if p.failures > 0 {
-				if pm.config.Verbose {
-					log.Printf("ProxyManager for %s: success reported for proxy %s. Resetting failure count.", pm.ctlog.GetMonitoringURL(), p.address)
-				}
-				p.failures = 0
-			}
-			if p.isUnhealthy {
-				if pm.config.Verbose {
-					log.Printf("ProxyManager for %s: proxy %s marked as HEALTHY again.", pm.ctlog.GetMonitoringURL(), p.address)
-				}
-				p.isUnhealthy = false
-			}
-			return
-		}
-	}
-}
-
-// startProbing periodically checks unhealthy proxies to see if they've recovered.
 func (pm *ProxyManager) startProbing(ctx context.Context) {
-	if pm.config.Verbose {
-		log.Printf("ProxyManager for %s: starting probe worker.", pm.ctlog.GetMonitoringURL())
-	}
 	ticker := time.NewTicker(probeInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -287,12 +270,8 @@ func (pm *ProxyManager) startProbing(ctx context.Context) {
 			for _, p := range pm.proxies {
 				if p.isUnhealthy && time.Now().After(p.cooldownUntil) {
 					if pm.config.Verbose {
-						log.Printf("ProxyManager for %s: probing proxy %s (cooldown finished). Moving to half-open state.", pm.ctlog.GetMonitoringURL(), p.address)
+						log.Printf("ProxyManager for %s: probing proxy %s. Moving to half-open state.", pm.ctlog.GetMonitoringURL(), p.address)
 					}
-					// This is the half-open state. We mark it as healthy
-					// so a worker can try it. If it fails, ReportFailure
-					// will mark it unhealthy again. If it succeeds, ReportSuccess
-					// will confirm it's healthy.
 					p.isUnhealthy = false
 					p.failures = 0
 				}
@@ -302,7 +281,6 @@ func (pm *ProxyManager) startProbing(ctx context.Context) {
 	}
 }
 
-// logStatus prints a summary of the current state of all proxies.
 func (pm *ProxyManager) logStatus() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -313,33 +291,92 @@ func (pm *ProxyManager) logStatus() {
 		if p.isUnhealthy {
 			status = fmt.Sprintf("UNHEALTHY (cooldown until %s)", p.cooldownUntil.Format(time.Kitchen))
 		}
-		statusStrings = append(statusStrings, fmt.Sprintf("%s: %s, failures: %d/%d", p.address, status, p.failures, failureThreshold))
+
+		slotsCapacity := cap(p.requestSlots)
+		usedSlots := slotsCapacity - len(p.requestSlots)
+
+		currentRequests := p.requestsCompleted.Load()
+		requestsSinceLast := currentRequests - p.lastLoggedRequests
+		p.lastLoggedRequests = currentRequests
+
+		statusStrings = append(statusStrings, fmt.Sprintf("%s: %s, fails: %d/%d, slots: %d/%d, avg_resp: %v, 429s(5m): %d, reqs: %d", p.address, status, p.failures, failureThreshold, usedSlots, slotsCapacity, p.rollingAverage().Round(time.Millisecond), p.count429s(rateLimitWindow), requestsSinceLast))
 	}
-	activeCount := pm.activeRequests.Load()
 	log.Printf(
-		"Proxy status for %s -> Active Requests: %d | [ %s ]",
+		"Proxy status for %s -> [ %s ]",
 		pm.ctlog.GetMonitoringURL(),
-		activeCount,
 		strings.Join(statusStrings, " | "),
 	)
 }
 
-// startStatusLogger runs a loop to periodically log the proxy statuses.
 func (pm *ProxyManager) startStatusLogger(ctx context.Context) {
-	// Don't log status if not in verbose mode.
 	if !pm.config.Verbose {
 		return
 	}
-
 	ticker := time.NewTicker(statusLogInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			pm.logStatus()
+		}
+	}
+}
+
+func (pm *ProxyManager) AddCertsProcessed(count int64) {
+	pm.certsProcessed.Add(count)
+}
+
+func (pm *ProxyManager) GetIssuerGetter() ctclient.IssuerGetter {
+	return pm.issuerGetter
+}
+
+func (pm *ProxyManager) startThroughputLogger(ctx context.Context) {
+	if !pm.config.Verbose {
+		return
+	}
+	ticker := time.NewTicker(throughputLogInterval)
+	defer ticker.Stop()
+	var lastCount int64
+	lastTime := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case t := <-ticker.C:
+			currentCount := pm.certsProcessed.Load()
+			elapsed := t.Sub(lastTime).Seconds()
+			processedInInterval := currentCount - lastCount
+			if elapsed > 0 {
+				rate := float64(processedInInterval) / elapsed
+				log.Printf(
+					"Throughput for %s -> Rate: %.2f certs/sec (Processed %d in last %.fs)",
+					pm.ctlog.GetMonitoringURL(),
+					rate,
+					processedInInterval,
+					elapsed,
+				)
+			}
+			lastCount = currentCount
+			lastTime = t
+		}
+	}
+}
+
+func (pm *ProxyManager) Report429(client429ed ctclient.Log) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	for _, p := range pm.proxies {
+		if p.client == client429ed {
+			p.recent429sMu.Lock()
+			p.recent429s = append(p.recent429s, time.Now())
+			p.recent429sMu.Unlock()
+			if pm.config.Verbose {
+				log.Printf("ProxyManager for %s: received 429 (Too Many Requests) for proxy %s.", pm.ctlog.GetMonitoringURL(), p.address)
+			}
+			return
 		}
 	}
 }

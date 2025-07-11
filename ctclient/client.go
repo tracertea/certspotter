@@ -26,6 +26,18 @@ import (
 
 var UserAgent = ""
 
+// HTTPError is returned by `get` when the HTTP status is not 200 OK.
+type HTTPError struct {
+	Status     string
+	StatusCode int
+	URL        string
+	Body       []byte
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("Get %q: %s (%q)", e.URL, e.Status, bytes.TrimSpace(e.Body))
+}
+
 // NewHTTPClient creates an HTTP client suitable for communicating with CT logs using the default environment proxy settings.
 func NewHTTPClient() *http.Client {
 	return NewHTTPClientWithProxy(nil)
@@ -115,15 +127,21 @@ func get(ctx context.Context, httpClient *http.Client, fullURL string) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
+	defer response.Body.Close()
 
-	responseBody, err := io.ReadAll(response.Body)
-	response.Body.Close()
-	if err != nil {
-		return nil, fmt.Errorf("Get %q: error reading response: %w", fullURL, err)
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		return nil, &HTTPError{
+			Status:     response.Status,
+			StatusCode: response.StatusCode,
+			URL:        fullURL,
+			Body:       body,
+		}
 	}
 
-	if response.StatusCode != 200 {
-		return nil, fmt.Errorf("Get %q: %s (%q)", fullURL, response.Status, bytes.TrimSpace(responseBody))
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Get %q: error reading response: %w", fullURL, err)
 	}
 
 	return responseBody, nil
