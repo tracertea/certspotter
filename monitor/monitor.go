@@ -250,7 +250,7 @@ func downloadJobSize(ctlog *loglist.Log) uint64 {
 }
 
 func downloadWorkers(ctlog *loglist.Log) int {
-	if ctlog.CertspotterDownloadJobs != 0 {
+	if ctlog.CertspotterDownloadJobs > 0 {
 		return ctlog.CertspotterDownloadJobs
 	} else {
 		return 1
@@ -312,31 +312,6 @@ func getEntriesFull(ctx context.Context, client ctclient.Log, startInclusive, en
 	return allEntries, nil
 }
 
-func getAndVerifySTH(ctx context.Context, ctlog *loglist.Log, client ctclient.Log) (*cttypes.SignedTreeHead, string, error) {
-	// Add a simple retry loop here for STH fetching, since it's a single request.
-	var sth *cttypes.SignedTreeHead
-	var url string
-	var err error
-	for i := 0; i < 5; i++ { // Try up to 5 times
-		sth, url, err = client.GetSTH(ctx)
-		if err == nil {
-			break
-		}
-		if ctx.Err() != nil {
-			return nil, "", ctx.Err()
-		}
-		time.Sleep(time.Duration(i+1) * time.Second)
-	}
-	if err != nil {
-		return nil, "", err
-	}
-
-	if err := ctcrypto.PublicKey(ctlog.Key).Verify(ctcrypto.SignatureInputForSTH(sth), sth.Signature); err != nil {
-		return nil, "", fmt.Errorf("STH has invalid signature: %w", err)
-	}
-	return sth, url, nil
-}
-
 type logClient struct {
 	config *Config
 	log    *loglist.Log
@@ -344,8 +319,17 @@ type logClient struct {
 }
 
 func (client *logClient) GetSTH(ctx context.Context) (sth *cttypes.SignedTreeHead, url string, err error) {
-	return getAndVerifySTH(ctx, client.log, client.client)
+	sth, url, err = client.client.GetSTH(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if err := ctcrypto.PublicKey(client.log.Key).Verify(ctcrypto.SignatureInputForSTH(sth), sth.Signature); err != nil {
+		return nil, "", fmt.Errorf("STH has invalid signature: %w", err)
+	}
+	return sth, url, nil
 }
+
 func (client *logClient) GetRoots(ctx context.Context) (roots [][]byte, err error) {
 	err = withRetry(ctx, client.config, client.log, -1, func() error {
 		roots, err = client.client.GetRoots(ctx)
@@ -444,45 +428,76 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 	if err != nil {
 		return fmt.Errorf("error loading log state: %w", err)
 	}
-	if state == nil {
-		client, _, err := proxyManager.GetClient()
-		if err != nil {
-			return fmt.Errorf("failed to get initial client: %w", err)
-		}
-		if config.StartAtEnd {
-			sth, _, err := client.GetSTH(ctx)
-			if err != nil {
-				return err
-			}
-			tree, err := client.ReconstructTree(ctx, sth)
-			if err != nil {
-				return err
-			}
-			state = &LogState{
-				DownloadPosition: tree,
-				VerifiedPosition: tree,
-				VerifiedSTH:      sth,
-				LastSuccess:      time.Now(),
-			}
-		} else {
-			state = &LogState{
-				DownloadPosition: merkletree.EmptyCollapsedTree(),
-				VerifiedPosition: merkletree.EmptyCollapsedTree(),
-				VerifiedSTH:      nil,
-				LastSuccess:      time.Now(),
-			}
-		}
+	_, override := config.ResumePoints[ctlog.GetCleanName()]
+	var startPosition uint64
+	if state != nil && !override {
+		startPosition = state.DownloadPosition.Size()
 		if config.Verbose {
-			log.Printf("%s: monitoring brand new log starting from position %d", ctlog.GetMonitoringURL(), state.DownloadPosition.Size())
-		}
-		if err := config.State.StoreLogState(ctx, ctlog.LogID, state); err != nil {
-			return fmt.Errorf("error storing log state: %w", err)
+			log.Printf("%s: resuming monitoring from position %d", ctlog.GetMonitoringURL(), startPosition)
 		}
 	} else {
+		if config.StartAtEnd {
+			// To start at the end, we need an initial STH fetch.
+			// This needs a client, but we don't want to get stuck if the first proxy is bad.
+			// So we'll use the proxy manager just for this single operation.
+			client, clientErr := proxyManager.GetClient(ctx)
+			if clientErr != nil {
+				return fmt.Errorf("failed to get initial client for start_at_end: %w", clientErr)
+			}
+
+			var sth *cttypes.SignedTreeHead
+			var sthErr error
+			// Use a non-nil duration to indicate success to the proxy manager
+			duration := new(time.Duration)
+
+			// Immediately-invoked function to handle defer
+			func() {
+				startTime := time.Now()
+				defer func() {
+					*duration = time.Since(startTime)
+				}()
+				sth, _, sthErr = client.GetSTH(ctx)
+			}()
+
+			if sthErr == nil {
+				proxyManager.ReleaseClient(client, duration) // Success
+				startPosition = sth.TreeSize
+			} else {
+				proxyManager.ReleaseClient(client, nil) // Failure
+				return sthErr
+			}
+
+		} else if resumeIndex, ok := config.ResumePoints[ctlog.GetCleanName()]; ok {
+			log.Printf("No state file for %s, resuming from index %d specified in resume file.", ctlog.GetCleanName(), resumeIndex)
+			startPosition = resumeIndex
+		}
+
+		tree := merkletree.EmptyCollapsedTree()
+		if startPosition > 0 {
+			if err := tree.AddHashes(startPosition); err != nil {
+				return fmt.Errorf("could not create synthetic collapsed tree: %w", err)
+			}
+		}
+
+		state = &LogState{
+			DownloadPosition: tree,
+			VerifiedPosition: tree,
+			VerifiedSTH:      nil,
+			LastSuccess:      time.Now(),
+		}
+
 		if config.Verbose {
-			log.Printf("%s: resuming monitoring from position %d", ctlog.GetMonitoringURL(), state.DownloadPosition.Size())
+			if startPosition > 0 {
+				log.Printf("%s: monitoring new log starting from position %d", ctlog.GetMonitoringURL(), startPosition)
+			} else {
+				log.Printf("%s: monitoring new log from beginning", ctlog.GetMonitoringURL())
+			}
+		}
+		if err := config.State.StoreLogState(ctx, ctlog.LogID, state); err != nil {
+			return fmt.Errorf("error storing initial log state: %w", err)
 		}
 	}
+
 	defer func() {
 		storeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -503,17 +518,16 @@ func monitorLogContinously(ctx context.Context, config *Config, ctlog *loglist.L
 	})
 
 retry:
-	position := state.DownloadPosition.Size()
+	position := startPosition // Use the determined start position for this run.
 
 	var latestTreeSize atomic.Uint64
 	if state.VerifiedSTH != nil {
 		latestTreeSize.Store(state.VerifiedSTH.TreeSize)
+	} else {
+		latestTreeSize.Store(position)
 	}
-
-	numDownloaders := downloadWorkers(ctlog) * len(proxyManager.proxies)
-	if numDownloaders == 0 {
-		numDownloaders = 1
-	}
+	slotsPerProxy := downloadWorkers(ctlog)
+	numDownloaders := slotsPerProxy * len(proxyManager.proxies)
 	numProcessors := runtime.NumCPU() * 2
 	if numProcessors < 4 {
 		numProcessors = 4
@@ -528,17 +542,18 @@ retry:
 
 	batchesToDownload := make(chan *batch, numDownloaders)
 	batchesToProcess := make(chan *batch, numDownloaders)
-	processedBatches := sequencer.New[batch](0, uint64(numDownloaders+numProcessors)*10)
+
+	downloadJobSizeVal := downloadJobSize(ctlog)
+	sequencerStart := position / downloadJobSizeVal
+	processedBatches := sequencer.New[batch](sequencerStart, uint64(numDownloaders+numProcessors)*10)
 
 	// A new errgroup is needed for each retry attempt.
 	group, gctx = errgroup.WithContext(ctx)
 
-	client, _, err := proxyManager.GetClient()
-	if err != nil {
-		return fmt.Errorf("no proxies available to start STH worker: %w", err)
-	}
-
-	group.Go(func() error { return getSTHAndUpdateWorker(gctx, client, &latestTreeSize) })
+	// The STH worker now manages its own client acquisition from the pool.
+	group.Go(func() error {
+		return getSTHAndUpdateWorker(gctx, proxyManager, &latestTreeSize)
+	})
 
 	group.Go(func() error {
 		defer close(batchesToDownload)
@@ -565,14 +580,13 @@ retry:
 	for i := 0; i < numProcessors; i++ {
 		group.Go(func() error {
 			defer processWg.Done()
-			return processWorker(gctx, config, ctlog, issuerGetter, batchesToProcess, certsToSave)
+			return processWorker(gctx, config, ctlog, issuerGetter, batchesToProcess, certsToSave, processedBatches)
 		})
 	}
 
 	group.Go(func() error {
 		processWg.Wait()
-		// No longer closing batchesToProcess here, it's handled by the download coordinator.
-		// We also don't close processedBatches here. It's closed by the saveStateWorker.
+		processedBatches.Close()
 		return nil
 	})
 
@@ -729,26 +743,60 @@ func newLogClientForProxy(config *Config, ctlog *loglist.Log, proxy string) (ctc
 	}
 }
 
-func getSTHAndUpdateWorker(ctx context.Context, client ctclient.Log, treeSize *atomic.Uint64) error {
+// fetchAndSetSTH acquires a client, fetches the STH, updates the tree size, and releases the client.
+func fetchAndSetSTH(ctx context.Context, pm *ProxyManager, treeSize *atomic.Uint64) error {
+	client, err := pm.GetClient(ctx)
+	if err != nil {
+		// This could happen if all proxies are down or the context is canceled.
+		return err
+	}
+
+	var fetchErr error
+	var duration time.Duration // To report success to the proxy manager
+	defer func() {
+		// Release the client, reporting success or failure.
+		if fetchErr != nil {
+			pm.ReleaseClient(client, nil) // nil duration indicates failure
+		} else {
+			pm.ReleaseClient(client, &duration) // non-nil duration indicates success
+		}
+	}()
+
+	startTime := time.Now()
+	sth, _, fetchErr := client.GetSTH(ctx)
+	duration = time.Since(startTime) // Record duration for metrics
+
+	if fetchErr != nil {
+		return fetchErr
+	}
+
+	// Atomically update the tree size on success.
+	treeSize.Store(sth.TreeSize)
+	return nil
+}
+
+func getSTHAndUpdateWorker(ctx context.Context, pm *ProxyManager, treeSize *atomic.Uint64) error {
 	ticker := time.NewTicker(getSTHInterval)
 	defer ticker.Stop()
 
-	for {
-		// Do one fetch immediately at the start.
-		sth, _, err := client.GetSTH(ctx)
-		if err != nil {
-			// This is a critical failure at the start, so we exit.
-			// In a more complex scenario, this could also have its own retry logic.
-			return err
-		}
-		// Atomically update the tree size.
-		treeSize.Store(sth.TreeSize)
+	// Initial fetch before the loop starts
+	if err := fetchAndSetSTH(ctx, pm, treeSize); err != nil {
+		// If the initial fetch fails, we can't proceed.
+		return fmt.Errorf("initial STH fetch failed: %w", err)
+	}
 
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
 			// Subsequent fetches happen on the ticker interval.
+			if err := fetchAndSetSTH(ctx, pm, treeSize); err != nil {
+				// Log the error but don't exit the worker. The ProxyManager will handle
+				// marking the proxy as unhealthy, and we will try again with a (hopefully)
+				// healthy proxy on the next tick.
+				recordError(ctx, pm.config, pm.ctlog, fmt.Errorf("failed to update STH: %w", err))
+			}
 		}
 	}
 }
@@ -846,9 +894,9 @@ func insertSTH(sths []*StoredSTH, sth *StoredSTH) []*StoredSTH {
 }
 
 func generateBatchesWorker(ctx context.Context, ctlog *loglist.Log, position *uint64, latestTreeSize *atomic.Uint64, batchesOut chan<- *batch) error {
-	var batchCounter uint64
-	currentPos := *position
 	downloadJobSize := downloadJobSize(ctlog)
+	batchCounter := *position / downloadJobSize
+	currentPos := *position
 
 	// Use a ticker to periodically check for new work, which is cleaner than a hot loop with sleep.
 	ticker := time.NewTicker(1 * time.Second)
@@ -895,86 +943,61 @@ func generateBatchesWorker(ctx context.Context, ctlog *loglist.Log, position *ui
 	}
 }
 
-// downloadWorker is now much smarter. It doesn't requeue work, but instead
-// tries to complete its assigned batch using any available healthy proxy.
 func downloadWorker(ctx context.Context, pm *ProxyManager, batchesIn <-chan *batch, batchesOut chan<- *batch) error {
-	for {
-		var batch *batch
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case batch = <-batchesIn:
-		}
+	for batch := range batchesIn {
+		var entries []ctclient.Entry
+		var err error
 
-		allEntries := make([]ctclient.Entry, 0, batch.end-batch.begin)
-		currentPos := batch.begin
-
-		// This is the new pagination loop.
-		for currentPos < batch.end {
-			// Fetch one page of entries with robust retry logic.
-			pageEntries, err := getEntriesWithRetry(ctx, pm, currentPos, batch.end-1)
-			if err != nil {
-				// If this fails permanently, the entire log monitoring will stop.
-				return err
+		// This loop will continue until the batch is successfully downloaded.
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
 			}
-			allEntries = append(allEntries, pageEntries...)
-			currentPos += uint64(len(pageEntries))
+
+			client, getClientErr := pm.GetClient(ctx)
+			if getClientErr != nil {
+				// This can happen if ctx is canceled or all proxies are unhealthy.
+				if errors.Is(getClientErr, context.Canceled) {
+					return getClientErr
+				}
+				// If we can't get a client, all proxies are likely down. Wait before retrying.
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			startTime := time.Now()
+			entries, err = client.GetEntries(ctx, batch.begin, batch.end-1)
+			duration := time.Since(startTime)
+
+			if err != nil {
+				pm.ReleaseClient(client, nil) // Report failure to the ProxyManager.
+				recordError(ctx, pm.config, pm.ctlog, fmt.Errorf("failed to download batch %d: %w", batch.number, err))
+				// The ProxyManager will mark the proxy as unhealthy if it fails enough times.
+				// We simply continue the loop to get a new client and retry the same batch.
+				continue
+			}
+
+			// Success!
+			pm.ReleaseClient(client, &duration) // Report success.
+			break                               // Exit the retry loop.
 		}
 
-		batch.entries = allEntries
+		batch.entries = entries
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case batchesOut <- batch:
+			// Batch successfully sent to the next stage.
 		}
 	}
+	return nil
 }
 
-// getEntriesWithRetry handles the entire lifecycle of fetching a page of entries,
-// including handling proxy failures and retries for that specific page.
-func getEntriesWithRetry(ctx context.Context, pm *ProxyManager, start, end uint64) ([]ctclient.Entry, error) {
-	for {
-		// On each attempt, get a new healthy client.
-		client, _, err := pm.GetClient()
-		if err != nil {
-			// All proxies are down, wait before the next attempt.
-			if err := sleep(ctx, 10*time.Second); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		pm.IncrementActive()
-		entries, err := client.GetEntries(ctx, start, end)
-		pm.AddCertsProcessed(int64(end - start))
-		pm.DecrementActive()
-		if err == nil {
-			pm.ReportSuccess(client)
-			return entries, nil
-		}
-
-		// Failure, report it. The loop will continue and try another proxy.
-		pm.ReportFailure(client)
-		recordError(ctx, pm.config, pm.ctlog, err)
-
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		// Brief sleep to prevent a tight loop if all proxies fail quickly.
-		if err := sleep(ctx, 1*time.Second); err != nil {
-			return nil, err
-		}
-	}
-}
-
-func processWorker(ctx context.Context, config *Config, ctlog *loglist.Log, issuerGetter ctclient.IssuerGetter, batchesIn <-chan *batch, certsToSave chan<- *DiscoveredCert) error {
-	for {
-		var batch *batch
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case batch = <-batchesIn:
-		}
+func processWorker(ctx context.Context, config *Config, ctlog *loglist.Log, issuerGetter ctclient.IssuerGetter, batchesIn <-chan *batch, certsToSave chan<- *DiscoveredCert, processedBatches *sequencer.Channel[batch]) error {
+	for batch := range batchesIn {
 		for offset, entry := range batch.entries {
 			index := batch.begin + uint64(offset)
 			if err := processLogEntry(ctx, config, issuerGetter, &LogEntry{
@@ -985,7 +1008,11 @@ func processWorker(ctx context.Context, config *Config, ctlog *loglist.Log, issu
 				return fmt.Errorf("error processing entry %d: %w", index, err)
 			}
 		}
+		if err := processedBatches.Add(ctx, batch.number, batch); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func saveStateWorker(ctx context.Context, config *Config, ctlog *loglist.Log, state *LogState, processedBatches *sequencer.Channel[batch], pm *ProxyManager) error {

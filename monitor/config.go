@@ -22,4 +22,5 @@ type Config struct {
 	StartIndex          uint64
 	EndIndex            uint64
 	Proxies             []string
+	ResumePoints        map[string]uint64
 }
