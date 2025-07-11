@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -160,6 +161,7 @@ func main() {
 		endIndex          uint64
 		localAddr         string
 		proxies           []string
+		resumeFromFile    string
 	}
 	flag.Func("batch_size", "Obsolete; do not use", func(string) error { flags.batchSize = true; return nil }) // TODO: remove in 0.21.0
 	flag.DurationVar(&flags.healthcheck, "healthcheck", 24*time.Hour, "How frequently to perform a health check")
@@ -176,6 +178,7 @@ func main() {
 	flag.Uint64Var(&flags.startIndex, "start-index", 0, "Log index to start processing from (requires -end-index).")
 	flag.Uint64Var(&flags.endIndex, "end-index", 0, "Log index to end processing at (requires -start-index).")
 	flag.StringVar(&flags.localAddr, "local-addr", "", "Local IP address to use for outbound connections.")
+	flag.StringVar(&flags.resumeFromFile, "resume-from-file", "", "Path to a JSON file specifying starting indices for individual logs.")
 	flag.Parse()
 
 	if flags.batchSize {
@@ -227,6 +230,18 @@ func main() {
 		Proxies:             flags.proxies,
 		StartIndex:          flags.startIndex,
 		EndIndex:            flags.endIndex,
+	}
+
+	if flags.resumeFromFile != "" {
+		data, err := os.ReadFile(flags.resumeFromFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: could not read resume file: %v\n", programName, err)
+			os.Exit(1)
+		}
+		if err := json.Unmarshal(data, &config.ResumePoints); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: could not parse resume file: %v\n", programName, err)
+			os.Exit(1)
+		}
 	}
 
 	if fsstate.Script == "" && !fileExists(fsstate.ScriptDir) && fsstate.Stdout == false {

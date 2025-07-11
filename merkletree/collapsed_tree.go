@@ -28,12 +28,13 @@ func calculateNumNodes(size uint64) int {
 	return bits.OnesCount64(size)
 }
 
-// TODO: phase out this function
+// EmptyCollapsedTree creates a new, empty collapsed tree.
 func EmptyCollapsedTree() *CollapsedTree {
 	return &CollapsedTree{nodes: []Hash{}, size: 0}
 }
 
-// TODO: phase out this function
+// NewCollapsedTree creates a new collapsed tree from an existing set of nodes and size.
+// It is the caller's responsibility to ensure the provided nodes and size are valid.
 func NewCollapsedTree(nodes []Hash, size uint64) (*CollapsedTree, error) {
 	tree := new(CollapsedTree)
 	if err := tree.Init(nodes, size); err != nil {
@@ -67,6 +68,19 @@ func (tree *CollapsedTree) Add(hash Hash) error {
 	tree.nodes = append(tree.nodes, hash)
 	tree.size++
 	tree.collapse()
+	return nil
+}
+
+// AddHashes efficiently adds a number of placeholder hashes to the tree,
+// simulating the process of adding many leaves at once. This is useful for
+// fast-forwarding the state of a tree.
+func (tree *CollapsedTree) AddHashes(count uint64) error {
+	placeholderHash := HashNothing()
+	for i := uint64(0); i < count; i++ {
+		if err := tree.Add(placeholderHash); err != nil {
+			return fmt.Errorf("failed to add hash at index %d: %w", tree.size, err)
+		}
+	}
 	return nil
 }
 
